@@ -95,4 +95,48 @@ if __name__ == "__main__":
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
 
+    config.training.skip_weight_loading = ft_config.skip_weight_loading
+
+    # HAMLET configuration
+    config.model.hamlet_mode = ft_config.hamlet_mode
+    config.model.n_moment_tokens = ft_config.n_moment_tokens
+    config.model.memory_window = ft_config.memory_window
+    config.model.memory_num_layers = ft_config.memory_num_layers
+    config.model.memory_stride = ft_config.memory_stride
+    config.model.mem_cond_type = ft_config.mem_cond_type
+    config.model.memory_type = ft_config.memory_type
+    if (
+        ft_config.hamlet_mode == "finetune"
+        and ft_config.freeze_moment_tokens
+        and not ft_config.load_moment_tokens_from
+    ):
+        print(
+            "[HAMLET][WARN] freeze_moment_tokens=True but no --load-moment-tokens-from "
+            "was given: randomly initialized moment tokens would stay frozen for the "
+            "whole run. Load TCL-pretrained tokens or pass --no-freeze-moment-tokens."
+        )
+    config.model.freeze_moment_tokens = ft_config.freeze_moment_tokens
+    config.model.tcl_tau = ft_config.tcl_tau
+    config.training.load_moment_tokens_from = ft_config.load_moment_tokens_from
+
+    # HAMLET — override video delta_indices on the registered modality configs.
+    if ft_config.hamlet_mode == "finetune" and ft_config.memory_window > 1:
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        stride = ft_config.memory_stride
+        K = ft_config.memory_window
+        new_indices = [-(K - 1 - i) * stride for i in range(K)]
+        for tag in MODALITY_CONFIGS:
+            if "video" in MODALITY_CONFIGS[tag]:
+                MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
+        config.data.allow_padding = True
+        print(f"[HAMLET] K-step batching: stride={stride} window={(K-1)*stride} delta_indices={new_indices}")
+    elif ft_config.hamlet_mode == "tcl":
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        new_indices = [0, -999]
+        for tag in MODALITY_CONFIGS:
+            if "video" in MODALITY_CONFIGS[tag]:
+                MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
+        config.data.allow_padding = True
+        print(f"[HAMLET-TCL] video delta_indices = {new_indices}")
+
     run(config)

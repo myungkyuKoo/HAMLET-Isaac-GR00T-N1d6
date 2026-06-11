@@ -103,6 +103,28 @@ class Gr00tN1d6Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # --- HAMLET ---
+    # hamlet_mode in {"off", "tcl", "finetune"}.
+    hamlet_mode: str = "finetune"
+    n_moment_tokens: int = 4
+    memory_window: int = 4
+    memory_num_layers: int = 2
+    # Env steps between cached memory snapshots; persisted to the checkpoint
+    # config so evaluation can enforce n_action_steps == memory_stride.
+    memory_stride: int = 16
+    freeze_moment_tokens: bool = False
+    # memory-to-action conditioning:
+    #   "cross_attn" (default): memory-aggregated moment tokens replace the backbone
+    #       moment-token tail and enter the DiT as cross-attention KV.
+    #   "adaln": the pooled memory vector is added (zero-init) to the DiT timestep
+    #       embedding and the moment-token tail is sliced off the KV (memory enters
+    #       only via AdaLN).
+    mem_cond_type: str = "cross_attn"
+    # What flows through the memory module: {"moment_token", "vision_feature"}.
+    memory_type: str = "moment_token"
+    # If None, defaults to `action_horizon` at runtime.
+    tcl_tau: float = 0.07
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

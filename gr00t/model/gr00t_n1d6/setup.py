@@ -64,8 +64,8 @@ class Gr00tN1d6Pipeline(ModelPipeline):
         """Setup model with proper vocabulary expansion."""
 
         # Build transformers loading kwargs from training config
-
-        if self.config.training.start_from_checkpoint is not None:
+        skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
+        if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -75,6 +75,16 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
+                # HAMLET overrides (control whether moment_tokens / memory_transformer are instantiated).
+                hamlet_mode=self.config.model.hamlet_mode,
+                n_moment_tokens=self.config.model.n_moment_tokens,
+                memory_window=self.config.model.memory_window,
+                memory_num_layers=self.config.model.memory_num_layers,
+                memory_stride=self.config.model.memory_stride,
+                mem_cond_type=self.config.model.mem_cond_type,
+                freeze_moment_tokens=self.config.model.freeze_moment_tokens,
+                memory_type=self.config.model.memory_type,
+                tcl_tau=self.config.model.tcl_tau,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -84,13 +94,122 @@ class Gr00tN1d6Pipeline(ModelPipeline):
             missing_keys = loading_info.get("missing_keys", [])
             mask_token_missing = any("mask_token" in key for key in missing_keys)
 
-            if mask_token_missing and model.action_head.mask_token is not None:
+            if mask_token_missing and getattr(model.action_head, "mask_token", None) is not None:
                 # Initialize mask_token
                 with torch.no_grad():
                     model.action_head.mask_token.data.copy_(
                         0.02 * torch.randn_like(model.action_head.mask_token)
                     )
                 logging.info("mask_token not in checkpoint - initialized")
+
+            # HAMLET — new modules are absent from a vanilla N1.6 base checkpoint.
+            # HF from_pretrained fills missing keys with torch.empty() (uninitialized memory
+            # -> potential NaN). Re-initialize them explicitly here.
+            hamlet_key_substrings = (
+                "backbone.moment_tokens",
+                "memory_transformer",
+                "moment_to_repr",
+                "mem_adaln_pool",
+            )
+
+            def _is_tolerated(k: str) -> bool:
+                if "mask_token" in k:
+                    return True
+                return any(sub in k for sub in hamlet_key_substrings)
+
+            other_missing = [k for k in missing_keys if not _is_tolerated(k)]
+            tolerated_missing = [k for k in missing_keys if _is_tolerated(k) and "mask_token" not in k]
+            if tolerated_missing:
+                logging.info(
+                    f"HAMLET keys missing from checkpoint (re-initializing): {tolerated_missing[:8]}..."
+                )
+                with torch.no_grad():
+                    if hasattr(model.backbone, "moment_tokens") and any(
+                        "backbone.moment_tokens" in k for k in tolerated_missing
+                    ):
+                        model.backbone.moment_tokens.data.normal_(mean=0.0, std=0.02)
+                    if (
+                        getattr(model.action_head, "memory_transformer", None) is not None
+                        and any("memory_transformer" in k for k in tolerated_missing)
+                    ):
+                        for m in model.action_head.memory_transformer.modules():
+                            if isinstance(m, torch.nn.Linear):
+                                m.weight.data.normal_(mean=0.0, std=0.02)
+                        for n, p in model.action_head.memory_transformer.named_parameters():
+                            if "norm" in n:
+                                p.data.fill_(1.0)
+                    if (
+                        getattr(model.action_head, "moment_to_repr", None) is not None
+                        and any("moment_to_repr" in k for k in tolerated_missing)
+                    ):
+                        for m in model.action_head.moment_to_repr.modules():
+                            if isinstance(m, torch.nn.Linear):
+                                m.weight.data.normal_(mean=0.0, std=0.02)
+                    if (
+                        getattr(model.action_head, "mem_adaln_pool", None) is not None
+                        and any("mem_adaln_pool" in k for k in tolerated_missing)
+                    ):
+                        # AdaLN-zero pool: proj zero-init (no-op), attention query/attn proper init.
+                        model.action_head.mem_adaln_pool.reset_parameters()
+
+            unexpected_keys = loading_info.get("unexpected_keys", [])
+            mismatched_keys = loading_info.get("mismatched_keys", [])
+            # In TCL mode the action_head is replaced by Gr00tN1d6TCLHead, so the
+            # diffusion-policy keys in the base ckpt are intentionally unexpected.
+            if self.config.model.hamlet_mode == "tcl":
+                unexpected_keys = [
+                    k for k in unexpected_keys
+                    if not (k.startswith("action_head.") and "moment_to_repr" not in k)
+                ]
+            errors = []
+            if other_missing:
+                errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
+            if unexpected_keys:
+                errors.append(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+            if mismatched_keys:
+                errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
+            if errors:
+                raise RuntimeError(
+                    "Checkpoint weight mismatch for "
+                    f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
+                )
+
+            # HAMLET Stage-2 entry: optionally overwrite freshly-initialized moment_tokens with
+            # the TCL-pretrained version from a Stage-1 checkpoint.
+            stage1_path = getattr(self.config.training, "load_moment_tokens_from", None)
+            if stage1_path is not None and hasattr(model.backbone, "moment_tokens"):
+                import os
+                from safetensors import safe_open
+                src_files = []
+                if os.path.isdir(stage1_path):
+                    for f in sorted(os.listdir(stage1_path)):
+                        if f.endswith(".safetensors"):
+                            src_files.append(os.path.join(stage1_path, f))
+                elif stage1_path.endswith(".safetensors"):
+                    src_files.append(stage1_path)
+                loaded = False
+                for f in src_files:
+                    with safe_open(f, framework="pt") as st:
+                        for k in st.keys():
+                            if k.endswith("backbone.moment_tokens") or k == "backbone.moment_tokens":
+                                t = st.get_tensor(k)
+                                with torch.no_grad():
+                                    model.backbone.moment_tokens.data.copy_(
+                                        t.to(model.backbone.moment_tokens.dtype).to(
+                                            model.backbone.moment_tokens.device
+                                        )
+                                    )
+                                loaded = True
+                                logging.info(
+                                    f"[HAMLET] Loaded moment_tokens from {f} ({k}); shape={tuple(t.shape)}"
+                                )
+                                break
+                    if loaded:
+                        break
+                if not loaded:
+                    raise RuntimeError(
+                        f"--load-moment-tokens-from set but backbone.moment_tokens not found under {stage1_path}"
+                    )
 
         else:
             model = self.model_class(
@@ -142,6 +261,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 use_alternate_vl_dit=self.model_config.use_alternate_vl_dit,
                 use_relative_action=self.model_config.use_relative_action,
+                hamlet_mode=self.model_config.hamlet_mode,
                 **self.transformers_loading_kwargs,
             )
         else:

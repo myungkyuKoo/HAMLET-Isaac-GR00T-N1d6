@@ -30,6 +30,7 @@ class TrainingConfig:
     optim: str = "adamw_torch_fused"
 
     start_from_checkpoint: Optional[str] = None
+    skip_weight_loading: bool = False  # skip loading checkpoint weights (architecture only)
 
     # Mixed precision
     tf32: bool = True
@@ -96,15 +97,5 @@ class TrainingConfig:
     # RL
     add_rl_callback: bool = False
 
-    # Open-loop evaluation
-    enable_open_loop_eval: bool = False
-    """Enable open-loop evaluation on saved checkpoints."""
-
-    open_loop_eval_traj_ids: list[int] = field(default_factory=lambda: [0])
-    """List of trajectory IDs to evaluate."""
-
-    open_loop_eval_steps_per_traj: int = 100
-    """Number of steps to evaluate per trajectory."""
-
-    open_loop_eval_plot_indices: Optional[list[int]] = None
-    """List of action indices to plot. If None, plots all indices."""
+    # HAMLET selective-load paths (Stage-2 entry)
+    load_moment_tokens_from: Optional[str] = None

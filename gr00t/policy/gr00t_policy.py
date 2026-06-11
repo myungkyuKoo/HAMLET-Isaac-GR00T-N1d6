@@ -93,6 +93,25 @@ class Gr00tPolicy(BasePolicy):
         self.modality_configs = self.processor.get_modality_configs()[self.embodiment_tag.value]
         self.collate_fn = self.processor.collator
 
+        # HAMLET inference: rolling cache lives on the model; per-session FIFO state is
+        # checkpointed here keyed by client-supplied session_id. Force the video modality
+        # to a single current frame so the backbone consumes one obs per call; the
+        # K=memory_window history is supplied via the cache.
+        self.use_hamlet_inference = getattr(self.model.config, "hamlet_mode", "off") == "finetune"
+        self._memory_cache: dict[str, torch.Tensor] = {}
+        # vision_feature models keep their rolling history in a separate model
+        # slot (action_head._vision_cache); isolate it per session exactly like
+        # the moment-token cache.
+        self._vision_session_cache: dict[str, torch.Tensor] = {}
+        # LRU bookkeeping: RoboMME-style rollouts mint a fresh session id per
+        # episode, so finished sessions would otherwise accumulate GPU tensors
+        # forever on a long-running server. Cap the number of live sessions.
+        self._session_lru: list[str] = []
+        self._session_cache_cap: int = 64
+        if self.use_hamlet_inference:
+            if "video" in self.modality_configs:
+                self.modality_configs["video"].delta_indices = [0]
+
         # Extract and validate language configuration
         # Currently only supports single language input per timestep
         language_keys = self.modality_configs["language"].modality_keys
@@ -338,9 +357,93 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
-        # Step 4: Run model inference to predict actions
+        # Step 4: Run model inference to predict actions.
+        # HAMLET inference: assemble per-session memory cache before the call,
+        # convert client reset flags into a tensor mask, then scatter results back.
+        mem_options: dict[str, Any] | None = None
+        session_ids = None
+        if self.use_hamlet_inference:
+            B = len(unbatched_observations)
+            reset_memory_flags: list[bool] | None = None
+            if options is not None:
+                session_ids = options.get("session_ids")
+                reset_memory_flags = options.get("reset_memory")
+            if session_ids is None:
+                session_ids = [f"default_{i}" for i in range(B)]
+            if reset_memory_flags is None:
+                reset_memory_flags = [False] * B
+
+            is_vision = (
+                getattr(self.model.action_head, "memory_type", "moment_token")
+                == "vision_feature"
+            )
+            cached = [
+                None if reset_memory_flags[i] else self._memory_cache.get(session_ids[i])
+                for i in range(B)
+            ]
+            ref = next((c for c in cached if c is not None), None)
+            if ref is not None:
+                placeholder = torch.zeros_like(ref)
+                stacked = torch.stack(
+                    [c if c is not None else placeholder for c in cached], dim=0
+                )
+                self.model.action_head._memory_cache = stacked.to(self.model.device)
+            else:
+                self.model.action_head._memory_cache = None
+            cached_vis = [
+                None if reset_memory_flags[i] else self._vision_session_cache.get(session_ids[i])
+                for i in range(B)
+            ]
+            ref_vis = next((c for c in cached_vis if c is not None), None)
+            if ref_vis is not None:
+                placeholder_vis = torch.zeros_like(ref_vis)
+                stacked_vis = torch.stack(
+                    [c if c is not None else placeholder_vis for c in cached_vis], dim=0
+                )
+                self.model.action_head._vision_cache = stacked_vis.to(self.model.device)
+            else:
+                self.model.action_head._vision_cache = None
+            # A sample resets when explicitly asked OR when the cache relevant to
+            # this model variant has no per-session state yet.
+            relevant = cached_vis if is_vision else cached
+            effective_reset = [
+                bool(reset_memory_flags[i] or relevant[i] is None) for i in range(B)
+            ]
+            reset_tensor = torch.tensor(effective_reset, dtype=torch.bool, device=self.model.device)
+            mem_options = {"reset_memory": reset_tensor}
+            if options is not None and options.get("prime_only"):
+                # Memory-priming call: update the cache but skip denoising so the
+                # seeded action-noise RNG is not advanced (strict paired comparison).
+                mem_options["prime_only"] = True
+
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if self.use_hamlet_inference:
+                model_pred = self.model.get_action(**collated_inputs, options=mem_options)
+            else:
+                model_pred = self.model.get_action(**collated_inputs)
+
+        if self.use_hamlet_inference:
+            new_cached = self.model.action_head._memory_cache
+            if new_cached is not None:
+                for i, sid in enumerate(session_ids):
+                    self._memory_cache[sid] = new_cached[i].detach().clone()
+            new_cached_vis = self.model.action_head._vision_cache
+            if new_cached_vis is not None:
+                for i, sid in enumerate(session_ids):
+                    self._vision_session_cache[sid] = new_cached_vis[i].detach().clone()
+            # Reset model's caches so the next call rebuilds them from per-session storage.
+            self.model.action_head._memory_cache = None
+            self.model.action_head._vision_cache = None
+            # Touch LRU order and evict sessions beyond the cap (oldest first).
+            for sid in session_ids:
+                if sid in self._session_lru:
+                    self._session_lru.remove(sid)
+                self._session_lru.append(sid)
+            while len(self._session_lru) > self._session_cache_cap:
+                stale = self._session_lru.pop(0)
+                self._memory_cache.pop(stale, None)
+                self._vision_session_cache.pop(stale, None)
+
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

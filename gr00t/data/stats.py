@@ -157,10 +157,17 @@ class RelativeActionLoader:
         # Convert to numpy arrays once - this is much faster than repeated pandas access
         state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
         action_data = df[action_key].values  # Shape: (episode_length, joint_dim)
+        # Match the training anchors: demo-phase frames (is_demo=True) receive no
+        # action loss, so exclude them from the stats distribution as well. The
+        # loader's processed DataFrame keeps only modality columns, so the flag
+        # is read directly from the source parquet.
+        demo_flags = self._episode_demo_flags(trajectory_id)
         trajectories = []
         usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
         action_delta_indices = np.array(self.modality_configs["action"].delta_indices)
         for i in range(usable_length):
+            if demo_flags is not None and i < len(demo_flags) and demo_flags[i]:
+                continue
             state_ind = self.modality_configs["state"].delta_indices[-1] + i
             action_inds = action_delta_indices + i
             last_state = state_data[state_ind]
@@ -181,6 +188,31 @@ class RelativeActionLoader:
             else:
                 raise ValueError(f"Unknown ActionType: {self.action_config.type}")
         return trajectories
+
+
+    def _episode_demo_flags(self, trajectory_id: int):
+        """Per-frame `is_demo` flags from the source parquet, or None when the
+        dataset has no such column (e.g., RoboCasa). `trajectory_id` is the
+        loader index; the parquet path is resolved via episodes_metadata."""
+        if getattr(self, "_has_is_demo", None) is False:
+            return None
+        # NOTE: no broad exception guard here on purpose - a parquet read error
+        # must FAIL the stats generation rather than silently leak demonstration
+        # frames into the relative stats. Only a genuinely absent `is_demo`
+        # column (e.g., RoboCasa) returns None.
+        import pyarrow.parquet as pq
+
+        episode_index = self.loader.episodes_metadata[trajectory_id]["episode_index"]
+        chunk_idx = episode_index // self.loader.chunk_size
+        path = self.loader.dataset_path / self.loader.data_path_pattern.format(
+            episode_chunk=chunk_idx, episode_index=episode_index
+        )
+        if getattr(self, "_has_is_demo", None) is None:
+            self._has_is_demo = "is_demo" in pq.read_schema(path).names
+        if not self._has_is_demo:
+            return None
+        col = pq.read_table(path, columns=["is_demo"])["is_demo"]
+        return col.to_numpy(zero_copy_only=False).astype(bool).reshape(-1)
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -208,6 +240,17 @@ def calculate_stats_for_key(
     }
 
 
+
+def _dataset_has_demo_column(dataset_path: Path | str) -> bool:
+    """True when the dataset's parquet files carry an `is_demo` column."""
+    import pyarrow.parquet as pq
+
+    dataset_path = Path(dataset_path)
+    with open(dataset_path / "meta" / "info.json") as f:
+        info = json.load(f)
+    first = dataset_path / info["data_path"].format(episode_chunk=0, episode_index=0)
+    return "is_demo" in pq.read_schema(first).names
+
 def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
     dataset_path = Path(dataset_path)
     action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
@@ -224,11 +267,20 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
             stats = json.load(f)
     else:
         stats = {}
+    has_demo = _dataset_has_demo_column(dataset_path)
     for action_key in sorted(action_keys):
-        if action_key in stats:
+        entry = stats.get(action_key)
+        if entry is not None and (not has_demo or entry.get("_demo_filtered")):
             continue
+        if entry is not None:
+            print(
+                f"[stats] {action_key}: existing relative stats predate demo-frame "
+                f"filtering (no _demo_filtered marker) - recomputing."
+            )
         print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
         stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
+        if has_demo:
+            stats[action_key]["_demo_filtered"] = True
     with open(stats_path, "w") as f:
         json.dump(to_json_serializable(dict(stats)), f, indent=4)
 

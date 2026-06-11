@@ -18,14 +18,52 @@ def extract_step_data(
     allow_padding: bool = False,
 ) -> VLAStepData:
     step_data = {}
+    traj_len = len(episode_data)
 
     # Extract data for each configured modality
     for modality, config in modality_configs.items():
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
-        if allow_padding:
-            indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+
+        # HAMLET-TCL: video modality with sentinel -999 -> resolve to a far-frame negative
+        # within the same trajectory (|t' - anchor| >= 16).
+        # Patterns supported:
+        #   [0, -999]            -> (anchor, far_negative)
+        #   [0, -8, -999]        -> (anchor, close_positive, far_negative)
+        if modality == "video" and -999 in config.delta_indices:
+            anchor = max(0, min(step_index, traj_len - 1))
+            all_idxs = np.arange(traj_len)
+            far_mask = np.abs(all_idxs - anchor) >= 16
+            far_idxs = all_idxs[far_mask]
+            if far_idxs.size > 0:
+                neg = int(np.random.choice(far_idxs))
+            else:
+                neg = int(np.clip(anchor + 16, 0, traj_len - 1))
+            if len(config.delta_indices) == 2 and config.delta_indices == [0, -999]:
+                indices_to_load = [anchor, neg]
+            elif (
+                len(config.delta_indices) == 3
+                and config.delta_indices[0] == 0
+                and config.delta_indices[-1] == -999
+            ):
+                close_offset = int(config.delta_indices[1])  # typically -8
+                close_mask = (np.abs(all_idxs - anchor) <= 8) & (all_idxs != anchor)
+                close_idxs = all_idxs[close_mask]
+                if close_idxs.size > 0:
+                    target_close = anchor + close_offset
+                    close = (
+                        int(target_close)
+                        if 0 <= target_close < traj_len and target_close != anchor
+                        else int(np.random.choice(close_idxs))
+                    )
+                else:
+                    close = int(np.clip(anchor + close_offset, 0, traj_len - 1))
+                indices_to_load = [anchor, close, neg]
+            else:
+                indices_to_load = [max(0, min(idx, traj_len - 1)) for idx in indices_to_load]
+        elif allow_padding:
+            indices_to_load = [max(0, min(idx, traj_len - 1)) for idx in indices_to_load]
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -173,9 +211,22 @@ class ShardedSingleStepDataset(ShardedDataset):
             f"No valid trajectories found for dataset {self.dataset_path}"
         )
 
+        # Resolve per-episode anchor indices first. Demo-phase anchors (is_demo=True)
+        # are dropped so no action loss is computed on demonstration frames; their
+        # moment tokens still populate the memory window via the K-step delta_indices.
+        # Datasets without an `is_demo` column are unaffected. Doing this before
+        # counting keeps the shard count in sync with the steps actually distributed.
+        episode_anchor_indices: dict[int, np.ndarray] = {}
+        for ep_idx in shuffled_episode_indices:
+            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            valid_mask = self._anchor_valid_mask(int(ep_idx), len(step_indices))
+            if valid_mask is not None:
+                step_indices = step_indices[valid_mask]
+            episode_anchor_indices[int(ep_idx)] = step_indices
+
         # Calculate total timesteps and required number of shards
         total_steps = np.sum(
-            [self.get_effective_episode_length(idx) for idx in shuffled_episode_indices]
+            [len(episode_anchor_indices[int(idx)]) for idx in shuffled_episode_indices]
         ).astype(int)
         num_shards = np.ceil(total_steps / self.shard_size).astype(int)
 
@@ -185,8 +236,9 @@ class ShardedSingleStepDataset(ShardedDataset):
 
         # Distribute episode sub-sequences across shards
         for ep_idx in shuffled_episode_indices:
-            # Split episode timesteps into multiple sub-sequences
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            step_indices = episode_anchor_indices[int(ep_idx)].copy()
+            if step_indices.size == 0:
+                continue
             self.rng.shuffle(step_indices)
             for i in range(num_splits):
                 split_step_indices = step_indices[i::num_splits]
@@ -211,6 +263,30 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Get the effective episode length accounting for action horizon."""
         original_length = self.episode_loader.get_episode_length(episode_index)
         return max(0, original_length - self.action_horizon + 1)
+
+    def _anchor_valid_mask(self, episode_index: int, effective_len: int) -> np.ndarray | None:
+        """Return a bool mask of anchor positions where is_demo=False.
+
+        For datasets without an `is_demo` column, returns None so the caller falls
+        back to using all anchors.
+        """
+        if effective_len <= 0:
+            return None
+        chunk_idx = episode_index // self.episode_loader.chunk_size
+        parquet_filename = self.episode_loader.data_path_pattern.format(
+            episode_chunk=chunk_idx, episode_index=episode_index
+        )
+        parquet_path = self.episode_loader.dataset_path / parquet_filename
+        try:
+            col_df = pd.read_parquet(parquet_path, columns=["is_demo"])
+        except (KeyError, ValueError, FileNotFoundError):
+            return None
+        flags = col_df["is_demo"].to_numpy().astype(bool)
+        if flags.ndim > 1:
+            flags = flags.reshape(-1)
+        # Restrict to effective length (drop tail accounting for action horizon).
+        flags = flags[:effective_len]
+        return ~flags
 
     def __len__(self):
         """Return the number of shards in the dataset."""

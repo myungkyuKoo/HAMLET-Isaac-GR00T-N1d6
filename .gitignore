@@ -25,6 +25,9 @@ out/
 recordings/
 plots/
 *.npz
+ckpt/
+output/
+*.mp4
 
 # C extensions
 *.so

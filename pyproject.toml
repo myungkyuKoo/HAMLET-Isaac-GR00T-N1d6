@@ -43,8 +43,6 @@ dependencies = [
     # triton is needed on aarch64 (GB200) but ships with torch on x86_64
     "triton==3.3.1; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flash-attn==2.7.4.post1",
-    "onnx>=1.20.0",
-    "tensorrt>=10.14.1.48.post1",
 ]
 
 [project.optional-dependencies]
@@ -99,7 +97,6 @@ exclude = [
     "logs",
     "*.ipynb",
     "gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2",
-    "external_dependencies",
 ]
 
 [tool.ruff.format]

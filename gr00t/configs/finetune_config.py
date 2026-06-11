@@ -1,5 +1,6 @@
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+from typing import Literal
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 
@@ -140,3 +141,53 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    skip_weight_loading: bool = False
+    """If True, skip loading model weights from base_model_path (architecture only).
+    Useful for CI/testing to skip the slow checkpoint shard loading."""
+
+    # --- HAMLET (History-Aware Memory with Learned Tokens) ---
+    hamlet_mode: Literal["off", "tcl", "finetune"] = "finetune"
+    """HAMLET training mode.
+    - "off": vanilla GR00T N1.6 finetune (no HAMLET).
+    - "tcl": Stage 1 — time-contrastive pretraining of moment tokens.
+    - "finetune": Stage 2 — HAMLET end-to-end fine-tune (memory module + action head).
+    """
+
+    n_moment_tokens: int = 4
+    """Number of learnable moment tokens (n_q) appended to the VLM input."""
+
+    memory_window: int = 4
+    """History window length T — number of past moment-token sets fed to the memory transformer."""
+
+    memory_stride: int = 16
+    """Stride (in env steps) between consecutive past snapshots in the HAMLET memory window.
+    Must equal `n_action_steps` (the inference replanning interval) so the cache, which is
+    updated once per policy call, naturally holds snapshots at [t-(K-1)S, ..., t-S, t]."""
+
+    memory_num_layers: int = 2
+    """Depth of the HAMLET memory transformer (paper default: 2)."""
+
+    mem_cond_type: Literal["cross_attn", "adaln"] = "cross_attn"
+    """How memory conditions the action head.
+    - "cross_attn" (default): memory-aggregated moment tokens replace the backbone
+      moment-token tail and enter the DiT as cross-attention KV.
+    - "adaln": the pooled memory vector goes through a zero-init Linear and is added to
+      the DiT timestep embedding; the moment-token tail is sliced off the KV."""
+
+    memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
+    """What flows through the memory module (action-head VLM conditioning is unchanged).
+    "moment_token": learnable moment tokens' post-LLM hidden states.
+    "vision_feature": primary view (first modality_key) image tokens, post-LLM, avg-pooled
+    to 64/step (no moment tokens added). Supports both mem_cond_type values."""
+
+    load_moment_tokens_from: str | None = None
+    """Stage-2 entry. Path to a Stage-1 (TCL) checkpoint or `model.safetensors`
+    from which the moment-token parameter is loaded."""
+
+    freeze_moment_tokens: bool = False
+    """Stage 2 freezes moment tokens by default (matches GR00T frozen-VLM recipe)."""
+
+    tcl_tau: float = 0.07
+    """InfoNCE temperature for the TCL stage."""
+

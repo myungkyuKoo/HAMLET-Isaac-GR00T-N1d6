@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import random
 import re
 from typing import Any, Dict, Literal
 import warnings
@@ -12,12 +13,47 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import torch
 import torchvision.transforms.v2 as transforms
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.utils import cached_file
+
+
+def _tcl_augment_pil(img):
+    """Stochastic photometric augmentation for the TCL positive view."""
+    input_is_array = isinstance(img, np.ndarray)
+    pil = Image.fromarray(img) if input_is_array else img
+    if random.random() > 0.5:
+        pil = ImageEnhance.Brightness(pil).enhance(random.uniform(0.9, 1.1))
+        pil = ImageEnhance.Contrast(pil).enhance(random.uniform(0.9, 1.1))
+        pil = ImageEnhance.Color(pil).enhance(random.uniform(0.9, 1.1))
+    if random.random() < 0.1:
+        pil = pil.filter(ImageFilter.GaussianBlur(radius=1))
+    if random.random() < 0.05:
+        pil = pil.convert("L").convert("RGB")
+    if random.random() < 0.3:
+        gamma = random.uniform(0.95, 1.05)
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+        arr = np.power(np.clip(arr, 0.0, 1.0), gamma) * 255.0
+        pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    if random.random() < 0.1:
+        arr = np.asarray(pil).copy()
+        h, w = arr.shape[:2]
+        eh, ew = random.randint(int(0.05 * h), int(0.15 * h) + 1), random.randint(
+            int(0.05 * w), int(0.15 * w) + 1
+        )
+        y0, x0 = random.randint(0, h - eh), random.randint(0, w - ew)
+        arr[y0 : y0 + eh, x0 : x0 + ew] = 0
+        pil = Image.fromarray(arr)
+    if random.random() < 0.3:
+        arr = np.asarray(pil, dtype=np.float32)
+        noise = np.random.normal(0.0, 4.0, size=arr.shape).astype(np.float32)
+        pil = Image.fromarray(np.clip(arr + noise, 0, 255).astype(np.uint8))
+    if input_is_array:
+        return np.asarray(pil)
+    return pil
 
 from .image_augmentations import (
     apply_with_replay,
@@ -67,33 +103,46 @@ class Gr00tN1d6DataCollator:
         self.model_type = model_type
         self.model_name = model_name
 
+    def _process_stream(self, batch, values_list, out_prefix):
+        text_list = []
+        image_inputs = []
+        for v in values_list:
+            text_list.append(v["text"])
+            image_inputs += v["images"]
+        if self.model_type == "eagle":
+            # Eagle's processor needs the conversation form to extract per-image features.
+            image_inputs, _ = self.processor.process_vision_info(
+                [v["conversation"] for v in values_list]
+            )
+        vlm_inputs = self.processor(
+            text=text_list,
+            images=image_inputs,
+            return_tensors="pt",
+            padding=True,
+        )
+        for k, v in vlm_inputs.items():
+            batch[f"{out_prefix}{k}"] = v
+
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
         keys = list(set().union(*(elem.keys() for elem in features)))
 
         for key in keys:
             values = [elem[key] for elem in features if key in elem]
-            if key == "vlm_content":
-                # Handle vlm_content specially - extract text and images
-                text_list = []
-                image_inputs = []
-                for v in values:
-                    curr_text_list = [v["text"]]
-
-                    text_list += curr_text_list
-                    curr_image_inputs = v["images"]
-                    image_inputs += curr_image_inputs
-
-                # NOTE: some VLMs need this, others don't.
-                if self.model_type == "eagle":
-                    image_inputs, _ = self.processor.process_vision_info(
-                        [v["conversation"] for v in values]
-                    )
-                vlm_inputs = self.processor(
-                    text=text_list, images=image_inputs, return_tensors="pt", padding=True
-                )
-                for k, v in vlm_inputs.items():
-                    batch[k] = v
+            if key == "vlm_content_list":
+                # HAMLET K-step: each sample's `vlm_content_list` is a list of K
+                # per-timestep dicts. Flatten B logical samples × K timesteps into
+                # B*K rows in order [s0_t0, s0_t1, ..., s1_t0, ...].
+                flat = []
+                for sample_list in values:
+                    flat.extend(sample_list)
+                self._process_stream(batch, flat, out_prefix="")
+            elif key == "vlm_content":
+                self._process_stream(batch, values, out_prefix="")
+            elif key == "vlm_content_aug":
+                self._process_stream(batch, values, out_prefix="aug_")
+            elif key == "vlm_content_neg":
+                self._process_stream(batch, values, out_prefix="neg_")
             elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
                 raise Exception("Not implemented")
             else:
@@ -132,8 +181,11 @@ class Gr00tN1d6Processor(BaseProcessor):
         use_relative_action: bool = False,
         embodiment_id_mapping: dict[str, int] | None = None,
         transformers_loading_kwargs: dict = {"trust_remote_code": True},
+        # HAMLET
+        hamlet_mode: str = "off",
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
+        self.hamlet_mode = hamlet_mode
 
         # Initialize StateActionProcessor for state/action normalization
         self.state_action_processor = StateActionProcessor(
@@ -372,13 +424,59 @@ class Gr00tN1d6Processor(BaseProcessor):
         else:
             language = content.text
 
-        vlm_inputs = self._get_vlm_inputs(
-            image_keys=image_keys,
-            images=content.images,
-            masks=content.masks,
-            image_transform=image_transform,
-            language=language,
-        )
+        hamlet_mode = getattr(self, "hamlet_mode", "off")
+        if hamlet_mode == "tcl" and self.training:
+            # TCL: video modality has K=2 frames per view (anchor + far-negative resolved
+            # via -999 sentinel in dataset). Produce three independent VLM streams:
+            #   - anchor:   anchor frame, standard augmentation pipeline
+            #   - aug:      anchor frame, TCL-specific stochastic photometric augmentation on top
+            #   - neg:      far-negative frame, standard augmentation pipeline
+            anchor_images = {v: [content.images[v][0]] for v in image_keys}
+            neg_images = {v: [content.images[v][1]] for v in image_keys}
+            pos_images = {v: [_tcl_augment_pil(img) for img in anchor_images[v]] for v in image_keys}
+            anchor_inputs = self._get_vlm_inputs(image_keys, anchor_images, None, image_transform, language)
+            pos_inputs = self._get_vlm_inputs(image_keys, pos_images, None, image_transform, language)
+            neg_inputs = self._get_vlm_inputs(image_keys, neg_images, None, image_transform, language)
+            vlm_inputs = {
+                "vlm_content": anchor_inputs["vlm_content"],
+                "vlm_content_aug": pos_inputs["vlm_content"],
+                "vlm_content_neg": neg_inputs["vlm_content"],
+            }
+        elif hamlet_mode == "finetune" and self.training:
+            # K-step batching: dataset returns K frames per view (oldest first -> current last).
+            K = len(next(iter(content.images.values())))
+            if self.use_albumentations:
+                # Apply the stochastic augmentation ONCE with a single replay shared
+                # across ALL K timesteps (and views) — matching the HAMLET research
+                # code, where the video transforms run on the whole K-frame clip
+                # before the per-timestep split (and matching inference, where all
+                # cached frames come from the same unaugmented stream).
+                transformed = {}
+                replay = None
+                for v in image_keys:
+                    t_imgs, replay = apply_with_replay(image_transform, content.images[v], None, replay)
+                    transformed[v] = t_imgs  # K tensors of (C, H, W), uint8
+                vlm_list = []
+                for k in range(K):
+                    step_stack = torch.stack([transformed[v][k] for v in image_keys]).numpy()  # (V, C, H, W)
+                    vlm_list.append(self._apply_vlm_processing(step_stack, language)["vlm_content"])
+            else:
+                # torchvision path (off by default): augmentation params remain per-frame.
+                vlm_list = []
+                for k in range(K):
+                    step_images = {v: [content.images[v][k]] for v in image_keys}
+                    vlm_list.append(
+                        self._get_vlm_inputs(image_keys, step_images, None, image_transform, language)["vlm_content"]
+                    )
+            vlm_inputs = {"vlm_content_list": vlm_list}
+        else:
+            vlm_inputs = self._get_vlm_inputs(
+                image_keys=image_keys,
+                images=content.images,
+                masks=content.masks,
+                image_transform=image_transform,
+                language=language,
+            )
 
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
@@ -529,6 +627,7 @@ class Gr00tN1d6Processor(BaseProcessor):
                 "color_jitter_params",
                 "use_relative_action",
                 "extra_augmentation_config",
+                "hamlet_mode",
             ]
             for key in override_keys:
                 if key in kwargs:
