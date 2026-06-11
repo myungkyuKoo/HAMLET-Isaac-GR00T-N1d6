@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import tree
 from einops import rearrange
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from pydantic import Field, PrivateAttr
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.data.data_collator import DataCollatorMixin
@@ -52,27 +52,70 @@ def build_eagle_processor(eagle_path: str) -> ProcessorMixin:
     return eagle_processor
 
 
+# --- HAMLET helpers -----------------------------------------------------------
+# Per-timestep eagle content keys for K-step batching;
+# anchor / positive / negative streams for TCL pretraining.
+_TIME_NUM_RE = re.compile(r"^eagle_content_(\d+)$")
+HAMLET_TCL_AUG_KEY = "eagle_content_aug"
+HAMLET_TCL_NEG_KEY = "eagle_content_neg"
+
+
 def collate(features: List[dict], eagle_processor) -> dict:
     batch = {}
-    keys = features[0].keys()
+    keys = list(features[0].keys())
+
+    # HAMLET: detect per-timestep eagle_content_<t> keys for K-step batching.
+    time_keys = sorted(
+        [k for k in keys if _TIME_NUM_RE.match(k)],
+        key=lambda k: int(_TIME_NUM_RE.match(k).group(1)),
+    )
+    # For HAMLET K-step training, concat tokens with "K-within-B" ordering so the
+    # backbone returns rows in the order [b0t0,b0t1,...,b0t(K-1), b1t0,...,b(B-1)t(K-1)].
+    # `_apply_memory` reshapes feats.view(B, K, ...) which requires this order.
+    if time_keys:
+        text_list = []
+        image_inputs = []
+        for elem in features:        # outer loop over batch (B)
+            for key in time_keys:    # inner loop over time (K), oldest -> current
+                v = elem[key]
+                text_list += v.get("text_list", [])
+                image_inputs += v.get("image_inputs", [])
+        if text_list:
+            eagle_inputs = eagle_processor(
+                text=text_list, images=image_inputs, return_tensors="pt", padding=True
+            )
+            for k, v in eagle_inputs.items():
+                batch["eagle_" + k] = v
+
+    # TCL aug/neg streams (separate tokenizer calls so the suffix is preserved).
+    aug_text, aug_imgs = [], []
+    neg_text, neg_imgs = [], []
 
     for key in keys:
+        if key in time_keys:
+            continue
         values = [elem[key] for elem in features]
 
         if key == "eagle_content":
             text_list = []
             image_inputs = []
             for v in values:
-                curr_text_list = v["text_list"]
-                curr_image_inputs = v["image_inputs"]
-                text_list += curr_text_list
-                image_inputs += curr_image_inputs
-            eagle_inputs = eagle_processor(
-                text=text_list, images=image_inputs, return_tensors="pt", padding=True
-            )
-            for k, v in eagle_inputs.items():
-                k = "eagle_" + k
-                batch[k] = v
+                text_list += v.get("text_list", [])
+                image_inputs += v.get("image_inputs", [])
+            if text_list:
+                eagle_inputs = eagle_processor(
+                    text=text_list, images=image_inputs, return_tensors="pt", padding=True
+                )
+                for k, v in eagle_inputs.items():
+                    batch["eagle_" + k] = v
+        elif key == HAMLET_TCL_AUG_KEY:
+            for v in values:
+                aug_text += v.get("text_list", [])
+                aug_imgs += v.get("image_inputs", [])
+        elif key == HAMLET_TCL_NEG_KEY:
+            for v in values:
+                neg_text += v.get("text_list", [])
+                neg_imgs += v.get("image_inputs", [])
         elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
             # Concat in existing batch dimension.
             batch[key] = torch.cat(values)
@@ -80,6 +123,16 @@ def collate(features: List[dict], eagle_processor) -> dict:
             # state, state_mask, action and action_mask.
             # Stack to form the batch dimension.
             batch[key] = torch.from_numpy(np.stack(values))
+
+    if aug_text:
+        aug_inputs = eagle_processor(text=aug_text, images=aug_imgs, return_tensors="pt", padding=True)
+        for k, v in aug_inputs.items():
+            batch[f"eagle_{k}_aug"] = v
+    if neg_text:
+        neg_inputs = eagle_processor(text=neg_text, images=neg_imgs, return_tensors="pt", padding=True)
+        for k, v in neg_inputs.items():
+            batch[f"eagle_{k}_neg"] = v
+
     return batch
 
 
@@ -357,3 +410,154 @@ class GR00TTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
+
+
+# --- HAMLET transforms --------------------------------------------------------
+# K-step batching and TCL pretraining variants. Both subclass GR00TTransform to
+# reuse the state/action prep + VLM image+text tokenization, and emit either
+# per-timestep `eagle_content_<t>` keys (K-step) or
+# `eagle_content` + `eagle_content_aug` + `eagle_content_neg` (TCL).
+
+
+class HamletKStepTransform(GR00TTransform):
+    """K-step HAMLET finetune transform.
+
+    The dataset emits a (T, V, H, W, C) video tensor with ``T == memory_window``
+    (configured via the ModalityConfig's ``delta_indices`` =
+    ``[-(K-1)*S, ..., -S, 0]``). This transform splits the T frames into K
+    independent eagle conversations (oldest first to current last) so the
+    backbone runs K rows per sample.
+    """
+
+    def apply_single(self, data: dict) -> dict:
+        transformed_data = {}
+
+        # 1) Prepare K-step video + language.
+        images = self._prepare_video(data).astype(np.uint8)  # (V, T, C, H, W)
+        T = images.shape[1]
+        language = self._prepare_language(data)
+
+        if self.training:
+            t_range = list(range(T))
+        else:
+            # At inference we only need the current step; the rolling memory
+            # cache holds the (T-1) past tokens (K=1 path in _apply_memory).
+            t_range = [T - 1]
+
+        for t_idx, t in enumerate(t_range):
+            batch_t = {"images": images[:, t : t + 1, :, :, :], "language": language}
+            vlm_t = self._apply_vlm_processing(batch_t)["eagle_content"]
+            transformed_data[f"eagle_content_{t_idx}"] = vlm_t
+
+        # 2) State + action (per sample, not per timestep).
+        state, state_mask, _ = self._prepare_state(data)
+        transformed_data["state"] = state
+        transformed_data["state_mask"] = state_mask
+
+        if self.training:
+            transformed_data["segmentation_target"] = np.zeros((2,))
+            transformed_data["segmentation_target_mask"] = np.zeros((1,))
+            transformed_data["has_real_action"] = np.ones((), dtype=bool)
+            actions, actions_mask, _ = self._prepare_action(data)
+            transformed_data["action"] = actions
+            transformed_data["action_mask"] = actions_mask
+
+        transformed_data["embodiment_id"] = self.get_embodiment_tag()
+        return transformed_data
+
+
+def _tcl_augment_image(img: np.ndarray) -> np.ndarray:
+    """Stochastic photometric augmentation for the TCL positive view.
+    Input/output: (H, W, C) uint8 ndarray.
+    """
+    pil = Image.fromarray(img)
+    if random.random() > 0.5:
+        pil = ImageEnhance.Brightness(pil).enhance(random.uniform(0.9, 1.1))
+        pil = ImageEnhance.Contrast(pil).enhance(random.uniform(0.9, 1.1))
+        pil = ImageEnhance.Color(pil).enhance(random.uniform(0.9, 1.1))
+    if random.random() < 0.1:
+        pil = pil.filter(ImageFilter.GaussianBlur(radius=1))
+    if random.random() < 0.05:
+        pil = pil.convert("L").convert("RGB")
+    if random.random() < 0.3:
+        gamma = random.uniform(0.95, 1.05)
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+        arr = np.power(np.clip(arr, 0.0, 1.0), gamma) * 255.0
+        pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    if random.random() < 0.1:
+        arr = np.asarray(pil).copy()
+        h, w = arr.shape[:2]
+        eh = random.randint(int(0.05 * h), int(0.15 * h) + 1)
+        ew = random.randint(int(0.05 * w), int(0.15 * w) + 1)
+        y0, x0 = random.randint(0, h - eh), random.randint(0, w - ew)
+        arr[y0 : y0 + eh, x0 : x0 + ew] = 0
+        pil = Image.fromarray(arr)
+    if random.random() < 0.3:
+        arr = np.asarray(pil, dtype=np.float32)
+        noise = np.random.normal(0.0, 4.0, size=arr.shape).astype(np.float32)
+        pil = Image.fromarray(np.clip(arr + noise, 0, 255).astype(np.uint8))
+    return np.asarray(pil)
+
+
+class HamletTclTransform(GR00TTransform):
+    """HAMLET TCL Stage-1 transform.
+
+    Expects the dataset's video tensor to have T==2 slices:
+      slice 0 = anchor (current step),
+      slice 1 = far-apart negative (resolved by ModalityConfig delta_indices
+                with a sentinel like [0, -999]).
+    Positive view is produced by applying TCL-specific stochastic photometric
+    augmentation to the anchor frame (single-view TCL).
+    """
+
+    def apply_single(self, data: dict) -> dict:
+        out = {}
+        prepared_images = self._prepare_video(data)  # (V, T, C, H, W)
+        assert prepared_images.ndim == 5
+        assert prepared_images.shape[1] >= 2, (
+            "TCL transform needs >=2 time slices [anchor, negative]"
+        )
+        num_views = prepared_images.shape[0]
+        keep_view = random.randint(0, num_views - 1)
+
+        # Anchor & negative: same view, different times.
+        images_anchor = prepared_images[keep_view : keep_view + 1, 0:1, ...].astype(np.uint8)
+        images_neg = prepared_images[keep_view : keep_view + 1, 1:2, ...].astype(np.uint8)
+        # Positive: same view+time as anchor with stochastic photometric augmentation
+        # (NOT identical to anchor — needed for non-trivial InfoNCE signal).
+        anchor_frame = images_anchor[0, 0]  # (C, H, W); reordered to (H, W, C) for PIL
+        if anchor_frame.shape[0] in (1, 3):
+            anchor_hwc = anchor_frame.transpose(1, 2, 0)
+        else:
+            anchor_hwc = anchor_frame
+        pos_hwc = _tcl_augment_image(anchor_hwc)
+        if anchor_frame.shape[0] in (1, 3):
+            pos_chw = pos_hwc.transpose(2, 0, 1)
+        else:
+            pos_chw = pos_hwc
+        images_pos = pos_chw[None, None, ...]  # (1, 1, C, H, W)
+
+        lang = self._prepare_language(data)
+        out["eagle_content"] = self._apply_vlm_processing(
+            {"images": images_anchor, "language": lang}
+        )["eagle_content"]
+        out["eagle_content_aug"] = self._apply_vlm_processing(
+            {"images": images_pos, "language": lang}
+        )["eagle_content"]
+        out["eagle_content_neg"] = self._apply_vlm_processing(
+            {"images": images_neg, "language": lang}
+        )["eagle_content"]
+
+        # State/action kept for collator compatibility (TCL head ignores them).
+        state, state_mask, _ = self._prepare_state(data)
+        out["state"] = state
+        out["state_mask"] = state_mask
+        if self.training:
+            out["segmentation_target"] = np.zeros((2,))
+            out["segmentation_target_mask"] = np.zeros((1,))
+            out["has_real_action"] = np.ones((), dtype=bool)
+            actions, actions_mask, _ = self._prepare_action(data)
+            out["action"] = actions
+            out["action_mask"] = actions_mask
+        out["embodiment_id"] = self.get_embodiment_tag()
+        return out

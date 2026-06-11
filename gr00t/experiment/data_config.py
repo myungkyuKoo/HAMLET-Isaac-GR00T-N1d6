@@ -700,6 +700,76 @@ class OxeDroidDataConfig(BaseDataConfig):
 ###########################################################################################
 
 
+class DroidEEFDataConfig(BaseDataConfig):
+    video_keys = ["video.primary", "video.wrist"]
+    state_keys = [
+        "state.end_effector_position",
+        "state.end_effector_rotation",
+        "state.gripper_position",
+    ]
+    action_keys = [
+        "action.end_effector_position",
+        "action.end_effector_rotation",
+        "action.gripper_close",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    action_indices = list(range(16))
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.end_effector_position": "min_max",
+                    "state.end_effector_rotation": "min_max",
+                    "state.gripper_position": "min_max",
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.end_effector_position": "min_max",
+                    "action.end_effector_rotation": "min_max",
+                    "action.gripper_close": "min_max",
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
 class AgibotGenie1DataConfig(BaseDataConfig):
     video_keys = [
         "video.top_head",
@@ -771,6 +841,89 @@ class AgibotGenie1DataConfig(BaseDataConfig):
 
 
 ###########################################################################################
+# HAMLET variants
+#
+# Both subclass SinglePandaGripperDataConfig to keep state/action normalization and
+# keys identical, overriding only the video modality config:
+#   - `single_panda_gripper_hamlet`: K-step video delta_indices (state stays
+#     single-frame). Uses HamletKStepTransform.
+#   - `single_panda_gripper_contrastive_sv`: video delta_indices = [0, -999] so the
+#     dataset returns (anchor, far-negative); the TCL transform draws the positive
+#     by augmenting the anchor. Uses HamletTclTransform.
+###########################################################################################
+
+
+class SinglePandaGripperHamletDataConfig(SinglePandaGripperDataConfig):
+    """K-step HAMLET finetune variant.
+
+    The K-step video delta_indices ``[-(K-1)*S, ..., -S, 0]`` is overridden at
+    runtime by `scripts/gr00t_finetune.py` to honor --memory-window; the stride S is
+    bound to the action chunk (= len(action_indices)). The default below is K=4,
+    stride=16 (action chunk = 16).
+    """
+
+    video_observation_indices = [-48, -32, -16, 0]  # K=4, stride=16 default
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        cfg = super().modality_config()
+        cfg["video"] = ModalityConfig(
+            delta_indices=self.video_observation_indices,
+            modality_keys=self.video_keys,
+        )
+        return cfg
+
+    def transform(self):
+        from gr00t.model.transforms import HamletKStepTransform
+
+        # Build the parent transform list, swap the final GR00TTransform for the
+        # HAMLET K-step variant.
+        base = super().transform()
+        new_transforms = list(base.transforms[:-1]) + [
+            HamletKStepTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            )
+        ]
+        return ComposedModalityTransform(transforms=new_transforms)
+
+
+class SinglePandaGripperContrastiveSvDataConfig(SinglePandaGripperDataConfig):
+    """Single-view TCL pretraining variant.
+
+    Video delta_indices [0, -999] tells the dataset to emit (anchor_t, far_t)
+    pairs; HamletTclTransform builds the positive in-place via image augment.
+    State is single-frame; actions are unused by the TCL head but kept for
+    collator compatibility.
+    """
+
+    video_observation_indices = [0, -999]
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        cfg = super().modality_config()
+        cfg["video"] = ModalityConfig(
+            delta_indices=self.video_observation_indices,
+            modality_keys=self.video_keys,
+        )
+        return cfg
+
+    def transform(self):
+        from gr00t.model.transforms import HamletTclTransform
+
+        base = super().transform()
+        new_transforms = list(base.transforms[:-1]) + [
+            HamletTclTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            )
+        ]
+        return ComposedModalityTransform(transforms=new_transforms)
+
+
+###########################################################################################
 
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
@@ -779,10 +932,13 @@ DATA_CONFIG_MAP = {
     "bimanual_panda_gripper": BimanualPandaGripperDataConfig(),
     "bimanual_panda_hand": BimanualPandaHandDataConfig(),
     "single_panda_gripper": SinglePandaGripperDataConfig(),
+    "single_panda_gripper_hamlet": SinglePandaGripperHamletDataConfig(),
+    "single_panda_gripper_contrastive_sv": SinglePandaGripperContrastiveSvDataConfig(),
     "so100": So100DataConfig(),
     "so100_dualcam": So100DualCamDataConfig(),
     "unitree_g1": UnitreeG1DataConfig(),
     "unitree_g1_full_body": UnitreeG1FullBodyDataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
+    "droid_eef": DroidEEFDataConfig(),
     "agibot_genie1": AgibotGenie1DataConfig(),
 }

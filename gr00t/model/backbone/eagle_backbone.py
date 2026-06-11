@@ -25,6 +25,9 @@ DEFAULT_EAGLE_PATH = os.path.join(
     os.path.dirname(gr00t.__file__), "model", "backbone", "eagle2_hg_model"
 )
 
+# Eagle LLM hidden size; moment tokens live at this dim before eagle_linear.
+EAGLE_HIDDEN_DIM = 2048
+
 
 class EagleBackbone(nn.Module):
 
@@ -38,11 +41,19 @@ class EagleBackbone(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        n_moment_tokens: int = 0,
+        freeze_moment_tokens: bool = False,
+        memory_type: str = "moment_token",
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            n_moment_tokens: if >0, append this many learnable moment tokens at
+                the tail of the LLM input. They attend to image+text via causal
+                self-attention; their VLM output slice feeds the memory module
+                (or the TCL head).
+            freeze_moment_tokens: if True, freeze the moment-token parameter.
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
@@ -51,7 +62,7 @@ class EagleBackbone(nn.Module):
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         if project_to_dim is not None:
-            self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
+            self.eagle_linear = torch.nn.Linear(EAGLE_HIDDEN_DIM, project_to_dim)
         else:
             self.eagle_linear = torch.nn.Identity()
 
@@ -60,6 +71,19 @@ class EagleBackbone(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self.memory_type = memory_type
+
+        # HAMLET moment tokens, initialized to 0.02 * N(0, 1).
+        self.n_moment_tokens = int(n_moment_tokens)
+        # Persist the freeze flag so set_trainable_parameters (which resets
+        # requires_grad=True on ALL params, and is re-invoked after
+        # from_pretrained) re-applies the moment-token freeze every time.
+        self.freeze_moment_tokens = bool(freeze_moment_tokens)
+        if self.n_moment_tokens > 0:
+            self.moment_tokens = nn.Parameter(0.02 * torch.randn(self.n_moment_tokens, EAGLE_HIDDEN_DIM))
+        else:
+            self.moment_tokens = None
+
         self.set_trainable_parameters(tune_llm, tune_visual)
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
@@ -72,6 +96,10 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
+        if getattr(self, "moment_tokens", None) is not None and getattr(
+            self, "freeze_moment_tokens", False
+        ):
+            self.moment_tokens.requires_grad_(False)
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -106,11 +134,66 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
+        if self.moment_tokens is not None:
+            return self._forward_eagle_with_moment_tokens(eagle_input)
+
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
+
+    def _forward_eagle_with_moment_tokens(self, eagle_input: dict):
+        """HAMLET forward: append moment_tokens to language_model input embeds, run
+        the LLM with the extended sequence, project, and return.
+
+        Last ``n_moment_tokens`` rows of ``eagle_features`` are the moment-token
+        outputs m'_t consumed by the memory transformer / TCL head.
+        """
+        bsz = eagle_input["input_ids"].size(0)
+        device = eagle_input["input_ids"].device
+        dtype = self.eagle_model.language_model.model.embed_tokens.weight.dtype
+
+        # Build mixed token+image embeddings.
+        token_emb = self.eagle_model.language_model.get_input_embeddings()(
+            eagle_input["input_ids"]
+        )  # (B, T, d_llm)
+        image_emb = self.eagle_model.extract_feature(eagle_input["pixel_values"]).to(dtype=dtype)
+        patch_emb = image_emb.reshape(-1, image_emb.size(-1))  # (sum_patches, d_llm)
+        image_mask = eagle_input["input_ids"] == self.eagle_model.image_token_index
+        assert int(image_mask.sum()) == patch_emb.size(0), (
+            f"#<image_pad> tokens ({int(image_mask.sum())}) != #patch embeddings ({patch_emb.size(0)})"
+        )
+        token_emb = token_emb.clone()
+        token_emb[image_mask] = patch_emb
+
+        # Append moment tokens at the tail; causal self-attention lets them see
+        # all preceding text+image tokens.
+        moment_raw = self.moment_tokens.to(dtype).unsqueeze(0).expand(bsz, -1, -1)
+        full_emb = torch.cat([token_emb, moment_raw], dim=1)
+        attn_mask = eagle_input["attention_mask"]
+        moment_mask = torch.ones(bsz, self.n_moment_tokens, dtype=attn_mask.dtype, device=device)
+        full_attn = torch.cat([attn_mask, moment_mask], dim=1)
+        # Moment tokens sit after right-padding in sequence order, but their RoPE
+        # positions continue from each sample's REAL length (= attention_mask.sum)
+        # so train-time (padded batch) and inference-time (no padding) relative
+        # distances to the content tokens match exactly.
+        seq_len = token_emb.size(1)
+        prefix_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        real_len = attn_mask.sum(dim=1, keepdim=True).to(torch.long)  # (B, 1)
+        mq_pos = real_len + torch.arange(self.n_moment_tokens, device=device).unsqueeze(0)
+        full_pos = torch.cat([prefix_pos, mq_pos], dim=1)
+
+        eagle_output = self.eagle_model.language_model(
+            inputs_embeds=full_emb,
+            attention_mask=full_attn,
+            position_ids=full_pos,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        eagle_features = eagle_output.hidden_states[self.select_layer]
+        eagle_features = self.eagle_linear(eagle_features)
+        return eagle_features, full_attn
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -128,6 +211,26 @@ class EagleBackbone(nn.Module):
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
 
-        return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
-        )  # [B, T2, hidden_size]
+        data = {"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+        if self.moment_tokens is not None:
+            data["n_moment_tokens"] = self.n_moment_tokens
+        elif self.memory_type == "vision_feature" and "eagle_input_ids" in vl_input:
+            # vision_feature: expose the primary (first) view's post-LLM image
+            # tokens, avg-pooled to 64/step, for the memory module. Each view is a
+            # separate Eagle image, so n_views = pixel_values rows / batch and
+            # tokens/view comes from the per-row image-token count (square grid).
+            from gr00t.model.memory import pool_primary_view
+
+            input_ids = vl_input["eagle_input_ids"]
+            pixel_values = vl_input.get("eagle_pixel_values")
+            image_mask = input_ids == self.eagle_model.image_token_index
+            B = input_ids.shape[0]
+            n_views = max(1, pixel_values.shape[0] // B) if pixel_values is not None else 1
+            total = int(image_mask[0].sum().item())
+            tpv = total // n_views
+            side = int(round(tpv**0.5))
+            if tpv > 0 and side * side == tpv:
+                data["primary_view_feature"] = pool_primary_view(
+                    eagle_embeds, image_mask, tpv, (side, side)
+                )
+        return BatchFeature(data=data)  # [B, T2, hidden_size]

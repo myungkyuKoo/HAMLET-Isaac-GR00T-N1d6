@@ -134,6 +134,46 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # ----------------- HAMLET -----------------
+    # These flow through to GR00T_N1_5.from_pretrained (model config) and into the
+    # data config's video delta_indices (for K-step batching).
+    hamlet_mode: Literal["off", "tcl", "finetune"] = "finetune"
+    """HAMLET training mode (this repo defaults to the HAMLET fine-tune).
+    - "off":      vanilla GR00T N1.5 finetune (no HAMLET).
+    - "tcl":      Stage 1 — time-contrastive pretraining of moment tokens.
+    - "finetune": Stage 2 — HAMLET end-to-end fine-tune (memory + action head)."""
+
+    n_moment_tokens: int = 4
+    """n_q: number of learnable moment tokens appended to the VLM input tail."""
+
+    memory_window: int = 4
+    """T: history window length for the memory transformer."""
+
+    memory_num_layers: int = 2
+    """Depth of the memory transformer (default: 2)."""
+
+    load_moment_tokens_from: str | None = None
+    """Stage-2 entry. Path to a Stage-1 (TCL) checkpoint or `model.safetensors`
+    from which the moment-token parameter is loaded."""
+
+    freeze_moment_tokens: bool = False
+    """Stage 2 freezes moment tokens by default (matches GR00T frozen-VLM recipe)."""
+
+    mem_cond_type: Literal["cross_attn", "adaln"] = "cross_attn"
+    """Memory-to-action conditioning: cross_attn (replace KV tail) or adaln
+    (mean-pooled memory added to the DiT timestep embedding)."""
+
+    memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
+    """What flows through the memory module: moment_token (learnable moment tokens)
+    or vision_feature (primary-view image tokens post-LLM, pooled to 64/step)."""
+
+    tcl_tau: float = 0.07
+    """InfoNCE temperature for the TCL stage."""
+
+    tcl_negative_min_gap: int | None = None
+    """Minimum gap (in env steps) between TCL anchor and negative. If None,
+    falls back to the data config's default (-999 sentinel)."""
+
 
 #####################################################################################
 # Helper functions
@@ -186,6 +226,55 @@ def _copy_partial_action_expert_weights(old_dict, new_dict, old_dim, new_dim):
     return new_dict
 
 
+def _hamlet_find_state_dict(path: str) -> dict:
+    """Locate a state_dict at *path*. Accepts a checkpoint directory or a file."""
+    from pathlib import Path
+
+    p = Path(path)
+    candidates = []
+    if p.is_dir():
+        for fname in ("model.safetensors", "pytorch_model.bin"):
+            f = p / fname
+            if f.exists():
+                candidates.append(f)
+        # sharded safetensors
+        candidates.extend(sorted(p.glob("model-*.safetensors")))
+    elif p.is_file():
+        candidates.append(p)
+
+    if not candidates:
+        raise FileNotFoundError(f"No state_dict found at {path}")
+
+    state_dict = {}
+    for f in candidates:
+        if f.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state_dict.update(load_file(str(f), device="cpu"))
+        else:
+            state_dict.update(torch.load(str(f), map_location="cpu"))
+    return state_dict
+
+
+def _hamlet_load_moment_tokens(model, path: str) -> None:
+    """Copy backbone.moment_tokens from a Stage-1 (TCL) checkpoint into *model*."""
+    sd = _hamlet_find_state_dict(path)
+    key_candidates = ["backbone.moment_tokens", "moment_tokens"]
+    found = None
+    for k in key_candidates:
+        if k in sd:
+            found = sd[k]
+            break
+    if found is None:
+        raise KeyError(
+            f"backbone.moment_tokens not in checkpoint at {path}; keys: {list(sd.keys())[:10]}..."
+        )
+    with torch.no_grad():
+        model.backbone.moment_tokens.copy_(found.to(model.backbone.moment_tokens.dtype))
+    print(f"[HAMLET] Loaded moment tokens from {path}: shape={tuple(found.shape)}")
+
+
+
 #####################################################################################
 # main training function
 #####################################################################################
@@ -198,6 +287,50 @@ def main(config: ArgsConfig):
 
     # 1.1 modality configs and transforms
     data_config_cls = load_data_config(config.data_config)
+
+    # HAMLET: rebuild the video delta_indices to honor --memory-window.
+    if config.hamlet_mode == "finetune" and config.memory_window > 1:
+        # Stride is bound to the action chunk (= len(action_indices)): the rolling
+        # cache advances one chunk per policy call at inference, so the K snapshots
+        # must be sampled one chunk apart at training to stay consistent.
+        stride = len(data_config_cls.action_indices)
+        K = config.memory_window
+        new_indices = [-(K - 1 - i) * stride for i in range(K)]
+        data_config_cls.video_observation_indices = new_indices
+        print(
+            f"[HAMLET] K-step batching: stride={stride} window={(K - 1) * stride} "
+            f"delta_indices={new_indices}"
+        )
+    elif config.hamlet_mode == "tcl":
+        # TCL pairs are [anchor, far_negative]. The -999 sentinel makes the
+        # dataset sample a random in-trajectory negative at least
+        # `tcl_negative_min_gap` frames from the anchor (default: one action
+        # chunk). A fixed [0, -gap] offset would pick the deterministic frame
+        # t-gap and clamp to the anchor itself at early frames, breaking the
+        # contrastive signal.
+        tcl_negative_min_gap = (
+            config.tcl_negative_min_gap
+            if config.tcl_negative_min_gap is not None
+            else len(data_config_cls.action_indices)
+        )
+        new_indices = [0, -999]
+        data_config_cls.video_observation_indices = new_indices
+        print(
+            f"[HAMLET-TCL] video delta_indices = {new_indices} "
+            f"(far-negative min gap = {tcl_negative_min_gap})"
+        )
+
+    if (
+        config.hamlet_mode == "finetune"
+        and config.freeze_moment_tokens
+        and not config.load_moment_tokens_from
+    ):
+        print(
+            "[HAMLET][WARN] freeze_moment_tokens=True but no --load-moment-tokens-from "
+            "was given: randomly initialized moment tokens would stay frozen for the "
+            "whole run. Load TCL-pretrained tokens or pass --no-freeze-moment-tokens."
+        )
+
     modality_configs = data_config_cls.modality_config()
     transforms = data_config_cls.transform()
 
@@ -240,6 +373,13 @@ def main(config: ArgsConfig):
         )
         print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
 
+    if config.hamlet_mode == "tcl":
+        # Plumb the far-negative minimum gap into the dataset sentinel resolver
+        # (see LeRobotSingleDataset.get_video).
+        _tcl_datasets = single_datasets if len(config.dataset_path) > 1 else [train_dataset]
+        for _ds in _tcl_datasets:
+            _ds.tcl_negative_min_gap = tcl_negative_min_gap
+
     # ------------ step 2: load model ------------
     # First, get the data config to determine action horizon
     data_action_horizon = len(data_config_cls.action_indices)
@@ -255,19 +395,39 @@ def main(config: ArgsConfig):
     assert hasattr(last_transform, "max_action_dim"), "GR00TTransform must have max_action_dim"
     data_max_action_dim = last_transform.max_action_dim
 
-    # Load model
+    # Load model. HAMLET kwargs flow through to GR00T_N1_5.from_pretrained,
+    # which mutates the model config before backbone/head are constructed.
     model = GR00T_N1_5.from_pretrained(
         pretrained_model_name_or_path=config.base_model_path,
         tune_llm=config.tune_llm,  # backbone's LLM
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        hamlet_mode=config.hamlet_mode,
+        n_moment_tokens=config.n_moment_tokens,
+        memory_window=config.memory_window,
+        memory_num_layers=config.memory_num_layers,
+        freeze_moment_tokens=config.freeze_moment_tokens,
+        mem_cond_type=config.mem_cond_type,
+        memory_type=config.memory_type,
+        tcl_tau=config.tcl_tau,
     )
 
+    # Optional Stage-2 entry: load the TCL-pretrained moment tokens. Only the
+    # moment-token parameter is copied; everything else keeps the base weights.
+    if config.load_moment_tokens_from is not None:
+        _hamlet_load_moment_tokens(model, config.load_moment_tokens_from)
+
     # Update action_horizon and max_action_dim to match data config
-    # Need to recreate action head with correct config since it was initialized with old config
-    action_horizon_mismatch = data_action_horizon != model.action_head.config.action_horizon
-    action_dim_mismatch = data_max_action_dim != model.action_head.config.action_dim
+    # Need to recreate action head with correct config since it was initialized with old config.
+    # Skipped in TCL mode: the contrastive head replaces the flow-matching action head
+    # (it has no action-head config, and no action prediction to align).
+    if config.hamlet_mode == "tcl":
+        action_horizon_mismatch = False
+        action_dim_mismatch = False
+    else:
+        action_horizon_mismatch = data_action_horizon != model.action_head.config.action_horizon
+        action_dim_mismatch = data_max_action_dim != model.action_head.config.action_dim
 
     if action_horizon_mismatch or action_dim_mismatch:
         # Store old values for logging

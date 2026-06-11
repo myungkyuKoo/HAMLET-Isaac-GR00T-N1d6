@@ -100,6 +100,8 @@ dist
 # Log
 *.log
 *.log.*
+slurm_out/
+MUJOCO_LOG.TXT
 
 # Data
 !**/alpaca-data-conversation.json
@@ -111,6 +113,8 @@ dist
 # Other
 .DS_Store
 wandb
+*.mp4
+output_summary*.txt
 
 # Playground
 playground/
@@ -122,3 +126,5 @@ playground/
 demo_data/gr00t-gr1-apple-to-shelf/
 tmp/
 output/
+ckpt/
+data/

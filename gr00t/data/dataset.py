@@ -430,6 +430,7 @@ class LeRobotSingleDataset(Dataset):
                 all_steps.append((trajectory_id, base_index))
         return all_steps
 
+
     def _get_modality_keys(self) -> dict:
         """Get the modality keys for the dataset.
         The keys are the modality names, and the values are the keys for each modality.
@@ -682,15 +683,29 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             np.ndarray: The video frames for the trajectory and frame indices. Shape: (T, H, W, C)
         """
-        # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
-        # print(f"{step_indices=}")
-        # Get the trajectory index
+        # delta_indices=[0, -999] means "[anchor, far_negative]".
+        delta_indices = self.delta_indices[key]
         trajectory_index = self.get_trajectory_index(trajectory_id)
-        # Ensure the indices are within the valid range
-        # This is equivalent to padding the video with extra frames at the beginning and end
-        step_indices = np.maximum(step_indices, 0)
-        step_indices = np.minimum(step_indices, self.trajectory_lengths[trajectory_index] - 1)
+        traj_len = self.trajectory_lengths[trajectory_index]
+        # Minimum |negative - anchor| distance; configurable via the
+        # `tcl_negative_min_gap` attribute set by the TCL training script
+        # (defaults to one action chunk = 16 frames).
+        min_gap = getattr(self, "tcl_negative_min_gap", None)
+        min_gap = 16 if min_gap is None else int(min_gap)
+        if -999 in delta_indices:
+            anchor = int(np.clip(base_index, 0, traj_len - 1))
+            all_idxs = np.arange(traj_len)
+            far_mask = np.abs(all_idxs - anchor) >= min_gap
+            far_idxs = all_idxs[far_mask]
+            if far_idxs.size > 0:
+                neg = int(np.random.choice(far_idxs))
+            else:
+                neg = int(np.clip(anchor + min_gap, 0, traj_len - 1))
+            step_indices = np.array([anchor, neg], dtype=int)
+        else:
+            step_indices = delta_indices + base_index
+            step_indices = np.maximum(step_indices, 0)
+            step_indices = np.minimum(step_indices, traj_len - 1)
         assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
         # Get the sub-key
         key = key.replace("video.", "")

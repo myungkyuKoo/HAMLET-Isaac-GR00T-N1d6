@@ -266,9 +266,13 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        temb_add: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
+        # AdaLN-zero HAMLET: inject pooled memory into the timestep conditioning.
+        if temb_add is not None:
+            temb = temb + temb_add
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()

@@ -326,6 +326,8 @@ class FlowmatchingActionHead(nn.Module):
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
+        # AdaLN-zero HAMLET: pooled memory added to the DiT timestep embedding.
+        mem_temb_add = backbone_output.get("mem_temb_add", None)
 
         model_output = self.model(
             hidden_states=sa_embs,
@@ -333,6 +335,7 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=vl_attn_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            temb_add=mem_temb_add,
         )
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -353,19 +356,32 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        # AdaLN-zero HAMLET: pooled memory added to the DiT timestep embedding.
+        mem_temb_add = backbone_output.get("mem_temb_add", None)
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        # Set initial actions as the sampled noise.
+        # Set initial actions as the sampled noise. When the env var
+        # GR00T_INFERENCE_SEED is set, draw from a persistent per-device generator
+        # seeded with that value so eval is fully deterministic and reproducible across
+        # runs (generator advances per call -> varied but reproducible noise). Default
+        # (unset) = nondeterministic global RNG (unchanged).
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        _noise_size = (batch_size, self.config.action_horizon, self.config.action_dim)
+        import os as _os
+        _inf_seed = _os.environ.get("GR00T_INFERENCE_SEED")
+        if _inf_seed is not None:
+            _gen = getattr(self, "_inference_gen", None)
+            if _gen is None:
+                _gen = torch.Generator(device=device)
+                _gen.manual_seed(int(_inf_seed))
+                self._inference_gen = _gen
+            actions = torch.randn(size=_noise_size, dtype=vl_embs.dtype, device=device, generator=_gen)
+        else:
+            actions = torch.randn(size=_noise_size, dtype=vl_embs.dtype, device=device)
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -395,6 +411,7 @@ class FlowmatchingActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
+                temb_add=mem_temb_add,
             )
             pred = self.action_decoder(model_output, embodiment_id)
 
