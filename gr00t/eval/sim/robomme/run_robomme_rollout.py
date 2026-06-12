@@ -110,6 +110,9 @@ def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride:
       exec  1 (E1 = obs[n_demo]    , reset_memory=False) -> cache = [F1, F2, F3, E1]
 
     Vanilla (no HAMLET) policies ignore reset_memory/session_ids -> effective no-op.
+
+    Raises on any prime-step failure: continuing with a partially primed window would
+    silently change what the evaluation measures for memory tasks.
     """
     n_total = len(env_obs["front_rgb_list"])
     if n_total <= 1 or K <= 1:
@@ -126,7 +129,10 @@ def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride:
         try:
             policy.get_action(step_obs, options=options)
         except Exception as exc:
-            print(f"[warn] HAMLET memory prime step {idx} failed: {exc}")
+            raise RuntimeError(
+                f"HAMLET memory priming failed at demo frame {idx} "
+                f"(prime step {i + 1}/{len(prime_indices)}, session_id={session_id!r})"
+            ) from exc
 
 
 def _save_episode_video(frames: list[np.ndarray], video_dir: Path, env_name: str,
@@ -166,6 +172,32 @@ def _update_csv(csv_path: Path, env_idx: int, episode_idx: int, success: bool,
     }
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df.to_csv(csv_path, index=False)
+
+
+def _check_output_dir_manifest(out_dir: Path, identity: dict) -> None:
+    """Bind `out_dir` to one policy/eval identity via policy_manifest.json.
+
+    The resume logic counts existing episode mp4s as done, so reusing an output
+    directory across checkpoints (or changed eval settings) would silently adopt
+    another run's results as this run's. The first run records its identity; later
+    runs must match it exactly or are refused.
+    """
+    manifest_path = out_dir / "policy_manifest.json"
+    if manifest_path.exists():
+        recorded = json.loads(manifest_path.read_text())
+        if recorded != identity:
+            diffs = {
+                k: {"recorded": recorded.get(k), "current": identity.get(k)}
+                for k in sorted(set(recorded) | set(identity))
+                if recorded.get(k) != identity.get(k)
+            }
+            raise RuntimeError(
+                f"{out_dir} already holds results for a different policy/eval identity; "
+                f"refusing to resume into it. Mismatched fields: {diffs}. "
+                f"Use a fresh --output-dir or remove the stale results."
+            )
+    else:
+        manifest_path.write_text(json.dumps(identity, indent=2) + "\n")
 
 
 @dataclass
@@ -275,6 +307,18 @@ def main(cfg: Config) -> None:
     out_dir = Path(cfg.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "simulation_results.csv"
+
+    _check_output_dir_manifest(
+        out_dir,
+        {
+            "model_config": str(Path(cfg.model_config).resolve()) if cfg.model_config else "",
+            "task_id": cfg.task_id,
+            "dataset": cfg.dataset,
+            "n_action_steps": cfg.n_action_steps,
+            "max_episode_steps": cfg.max_episode_steps,
+            "inference_seed": os.environ.get("GR00T_INFERENCE_SEED", ""),
+        },
+    )
 
     # Resume detection: count existing finished episodes from filenames.
     done_eps: set[int] = set()

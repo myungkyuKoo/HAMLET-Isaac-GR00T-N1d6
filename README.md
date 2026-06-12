@@ -71,6 +71,7 @@ torchrun ... gr00t/experiment/launch_finetune.py ... \
 ```bash
 # install this repo (uv; see NVIDIA Isaac-GR00T for full prerequisites)
 uv sync && uv pip install -e .
+source .venv/bin/activate
 ```
 
 The base VLM is **`nvidia/GR00T-N1.6-3B`** (downloaded automatically by `--base-model-path` on first run).
@@ -87,6 +88,20 @@ We train on the official **[RoboMME](https://robomme.github.io/)** benchmark dat
 
 ```bash
 huggingface-cli download --repo-type dataset Yinpei/robomme_data_lerobot --local-dir data/robomme
+```
+
+**Dataset preparation (one-time, required).** The Hub release stores camera frames *inside* the parquet files (`image`-dtype features) and ships no `videos/` directory, no `meta/modality.json`, and no `meta/stats.json` — all three of which the GR00T loader requires. After downloading, run:
+
+```bash
+# 1) transcode the parquet-embedded frames into the videos/ layout the loader reads
+python gr00t/data/make_videos.py --dataset-path data/robomme
+
+# 2) install the GR00T modality mapping (state/action slices + camera-key renames)
+cp gr00t/configs/data/robomme_modality.json data/robomme/meta/modality.json
+
+# 3) generate normalization stats (demo frames are excluded from relative-action stats)
+python gr00t/data/stats.py --dataset-path data/robomme --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path gr00t/configs/data/robomme_config.py
 ```
 
 **Demonstration frames.** RoboMME episodes include demonstration (watch-phase) frames. They are automatically excluded from the action loss while still populating the memory window, and at evaluation the demo frames are replayed through the policy to prime the memory before the first action.
@@ -116,23 +131,29 @@ K=8 MEMORY_TYPE=vision_feature DATASET_PATH=data/robomme bash run_scripts/train_
 
 Evaluation uses a **policy-server / rollout-client** split: this repo serves the trained GR00T policy over a local socket (`gr00t/eval/run_gr00t_server.py`), and the RoboMME rollout client drives the simulator and queries the server. The rollout client is **included in this repo** (`gr00t/eval/sim/robomme/run_robomme_rollout.py`); only the **simulator** is external.
 
-**1) Install the RoboMME benchmark (separate environment).** Follow the official instructions at [robomme.github.io](https://robomme.github.io/); it provides the `robomme` package (env + `BenchmarkEnvBuilder`). Create a dedicated venv and set `ROBOMME_PYTHON` to its python. The rollout client runs in that environment (with this repo on `PYTHONPATH`, handled by the script).
+**1) Install the RoboMME benchmark (separate environment).** Follow the official instructions at [robomme.github.io](https://robomme.github.io/) (clone [`RoboMME/robomme_benchmark`](https://github.com/RoboMME/robomme_benchmark), then `uv sync && uv pip install -e .` inside it); it provides the `robomme` package (env + `BenchmarkEnvBuilder`). Set `ROBOMME_PYTHON` to that venv's python. The rollout client runs in that environment (with this repo on `PYTHONPATH`, handled by the script), so it also needs this repo's client-side deps (`msgpack`/`pyzmq` for the ZMQ policy client, `pandas` for `simulation_results.csv`), which a default benchmark sync does not install:
+
+```bash
+# inside the robomme_benchmark checkout
+uv pip install -r ./run_scripts/robomme_client_requirements.txt
+```
+
+`uv sync` prunes packages that are not in the benchmark's lockfile — re-run this install after any `uv sync` there.
 
 **2) Run eval** (orchestrates server + client over all 16 tasks):
 
 ```bash
 MODEL_PATH=runs/robomme/hamlet_n1d6/checkpoint-60000 \
 ROBOMME_PYTHON=/path/to/robomme_benchmark/venv/bin/python \
-OUTPUT_DIR=runs/eval/robomme \
 bash run_scripts/eval_n1d6.sh
 ```
 
-`ONLY_TASKS=BinFill,PatternLock` restricts to a subset; `GR00T_INFERENCE_SEED` (default 6) fixes the flow-matching noise for deterministic eval.
+`OUTPUT_DIR` defaults to `runs/eval/robomme/<run>-<checkpoint>` (here `runs/eval/robomme/hamlet_n1d6-checkpoint-60000`), and each per-task output directory is bound to its checkpoint and eval settings via a `policy_manifest.json`: resuming into results from a different checkpoint fails instead of silently reusing them. `ONLY_TASKS=BinFill,PatternLock` restricts to a subset; `GR00T_INFERENCE_SEED` fixes the flow-matching noise for deterministic eval. Each task waits for its policy server to come up (`SERVER_TIMEOUT`, default 300 s); a task fails when the server never becomes ready, the rollout client exits non-zero, or no `simulation_results.csv` appears, and the script then exits non-zero listing the failed tasks.
 
 **3) Aggregate** per-task results into suite + overall success rates:
 
 ```bash
-python gr00t/eval/sim/robomme/aggregate_eval_summary.py runs/eval/robomme
+python gr00t/eval/sim/robomme/aggregate_eval_summary.py runs/eval/robomme/hamlet_n1d6-checkpoint-60000
 ```
 
 ## 📁 Repository layout

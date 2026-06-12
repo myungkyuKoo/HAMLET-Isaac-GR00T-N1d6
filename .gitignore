@@ -28,6 +28,7 @@ plots/
 ckpt/
 output/
 *.mp4
+*logs*
 
 # C extensions
 *.so

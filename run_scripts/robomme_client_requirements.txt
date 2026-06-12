@@ -1,0 +1,10 @@
+# Client-side dependencies for gr00t/eval/sim/robomme/run_robomme_rollout.py when it
+# runs under the RoboMME benchmark venv (ROBOMME_PYTHON): the ZMQ policy client
+# (gr00t/policy/server_client.py) needs msgpack + pyzmq, and the rollout writes
+# simulation_results.csv via pandas. None of these are installed by the benchmark's
+# default `uv sync` (msgpack exists only in its optional `server` dependency group;
+# pyzmq/pandas are not declared at all), and `uv sync` prunes anything outside its
+# lockfile - re-install this file into the benchmark venv after every sync there.
+msgpack==1.2.0
+pyzmq==27.1.0
+pandas==3.0.3

@@ -1,14 +1,19 @@
 #!/usr/bin/env python
 """
 Calculate dataset statistics for LeRobot datasets.
-Note: Please update the `gr00t/configs/data/embodiment_configs.py` file with the correct modality configurations for the dataset you are using before running this script.
+Note: The embodiment's modality configuration must be registered before relative-action
+stats can be generated. Either update `gr00t/configs/data/embodiment_configs.py`, or pass
+`--modality-config-path` pointing to a config module that calls `register_modality_config()`
+(e.g., `gr00t/configs/data/robomme_config.py`), mirroring `launch_finetune.py`.
 
 Usage:
-    python gr00t/data/stats.py <dataset_path> <embodiment_tag>
+    python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <EMBODIMENT_TAG> \
+        [--modality-config-path gr00t/configs/data/robomme_config.py]
 
 Args:
     dataset_path: Path to the dataset.
     embodiment_tag: Embodiment tag to use to load modality configurations from `gr00t/configs/data/embodiment_configs.py`.
+    modality_config_path: Optional .py config that registers the embodiment's modality config on import.
 """
 
 import json
@@ -53,9 +58,10 @@ def calculate_dataset_statistics(
         sorted(list(parquet_paths)),
         desc="Collecting all parquet files...",
     ):
-        # Load the parquet file
-        parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
+        # Load only the requested low-dim columns: datasets that embed camera frames in
+        # the parquet (e.g., RoboMME image dtype features) would otherwise be read fully
+        # into RAM, which scales with the raw dataset size instead of the float columns.
+        parquet_data = pd.read_parquet(parquet_path, columns=features)
         all_low_dim_data_list.append(parquet_data)
     all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
     # Compute dataset statistics
@@ -285,7 +291,22 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         json.dump(to_json_serializable(dict(stats)), f, indent=4)
 
 
-def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
+def main(
+    dataset_path: Path | str,
+    embodiment_tag: EmbodimentTag,
+    modality_config_path: str | None = None,
+):
+    if modality_config_path is not None:
+        # Same dynamic registration as launch_finetune.py: importing the module calls
+        # register_modality_config() so MODALITY_CONFIGS[embodiment_tag] resolves below.
+        import importlib
+        import sys
+
+        path = Path(modality_config_path)
+        if not (path.exists() and path.suffix == ".py"):
+            raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
+        sys.path.append(str(path.parent))
+        importlib.import_module(path.stem)
     generate_stats(dataset_path)
     generate_rel_stats(dataset_path, embodiment_tag)
 
