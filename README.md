@@ -51,16 +51,24 @@ The HAMLET layer is exposed through a few CLI flags on top of the standard GR00T
 **Moment-token initialization (TCL, optional).** Following the paper, the moment tokens can be warm-started with time-contrastive learning before the HAMLET fine-tune, then loaded (and optionally frozen) in Stage 2:
 
 ```bash
-# Stage 1 — TCL pretraining of the moment tokens (VLM frozen)
-python scripts/gr00t_finetune.py ... --hamlet-mode tcl --n-moment-tokens 4
+# Stage 1: TCL pretraining of the moment tokens (VLM frozen).
+python scripts/gr00t_finetune.py ... --hamlet-mode tcl \
+    --data-config single_panda_gripper_contrastive_sv --n-moment-tokens 4
 
-# Stage 2 — HAMLET fine-tune, warm-starting from the Stage-1 tokens
+# Stage 2: HAMLET fine-tune, warm-starting from the Stage-1 tokens.
 python scripts/gr00t_finetune.py ... --hamlet-mode finetune \
+    --data-config single_panda_gripper_hamlet \
     --load-moment-tokens-from <stage1-output>/checkpoint-<N> \
     --freeze-moment-tokens
+
+# Single-stage training: you may skip TCL-initialization and randomly initialize moment tokens.
+python scripts/gr00t_finetune.py ... --hamlet-mode finetune \
+    --data-config single_panda_gripper_hamlet \
+    --n-moment-tokens 4 \
+    --no-freeze-moment-tokens
 ```
 
-`--load-moment-tokens-from` accepts a checkpoint directory or a `model*.safetensors` file and copies **only** `backbone.moment_tokens` (everything else still initializes from `--base-model-path`). Without it, moment tokens are randomly initialized and trained end-to-end — the default in `run_scripts/train_hamlet_n1d5.sh` (override via the `LOAD_MOMENT_TOKENS_FROM` / `FREEZE_MOMENT_TOKENS=1` environment variables).
+`--load-moment-tokens-from` accepts a checkpoint directory or a `model*.safetensors` file and copies **only** `backbone.moment_tokens` (everything else still initializes from `--base-model-path`). Without it, moment tokens are randomly initialized and trained end-to-end — the single-stage default in `run_scripts/train_hamlet_n1d5.sh` (opt into the two-stage recipe via the `LOAD_MOMENT_TOKENS_FROM` / `FREEZE_MOMENT_TOKENS=1` environment variables).
 
 
 ## ⚙️ Setup
@@ -118,18 +126,20 @@ Evaluation uses a **policy-server / rollout-client** split: this repo serves the
 
 **1) Install the benchmark simulator (separate environment).**
 
-| Benchmark | Repository | Notes |
-|---|---|---|
-| RoboCasa-Kitchen | <https://github.com/robocasa/robocasa> | RoboCasa + robosuite; create a dedicated venv per the repo's instructions. |
+```bash
+bash gr00t/eval/sim/robocasa/setup_robocasa.sh
+```
 
-Set `BENCH_PYTHON` to that environment's python. The rollout client runs in it (with this repo on `PYTHONPATH`, handled by the script). `ROLLOUT` defaults to the in-repo client and only needs setting if you relocate it.
+The script clones the **GR00T fork of RoboCasa** (<https://github.com/squarefk/robocasa>) into `external_dependencies/robocasa`, builds a dedicated venv at `gr00t/eval/sim/robocasa/venv` (robosuite + robocasa + the rollout-client deps; no GR00T model stack or flash-attn required), and downloads the kitchen assets (~5 GB).
+
+Set `BENCH_PYTHON` to that environment's python (`gr00t/eval/sim/robocasa/venv/bin/python`). The rollout client runs in it (with this repo on `PYTHONPATH`, handled by the script). `ROLLOUT` defaults to the in-repo client and only needs setting if you relocate it.
 
 **2) Run eval** (orchestrates server + client over all tasks):
 
 ```bash
 # RoboCasa (HAMLET ckpt: also pass DATA_CONFIG_OVERRIDE=single_panda_gripper_hamlet)
 MODEL_PATH=runs/robocasa/hamlet_n1d5/checkpoint-60000 \
-BENCH_PYTHON=/path/to/robocasa/.venv/bin/python \
+BENCH_PYTHON=gr00t/eval/sim/robocasa/venv/bin/python \
 OUTPUT_DIR=runs/eval/robocasa \
 bash run_scripts/eval_n1d5.sh
 ```
@@ -152,7 +162,7 @@ gr00t/                     core GR00T package + HAMLET additions
   model/backbone/          Eagle backbone (moment-token injection, primary-view feature)
   policy/server_client.py  ZMQ policy client used by the rollout client
   eval/rollout_policy.py   RoboCasa rollout client
-  eval/sim/robocasa/       RoboCasa env wrappers + result aggregation
+  eval/sim/robocasa/       simulator venv builder (setup_robocasa.sh) + result aggregation
 scripts/                   python entrypoints
   gr00t_finetune.py        finetune entrypoint
   run_gr00t_server_n1d5.py policy server for evaluation

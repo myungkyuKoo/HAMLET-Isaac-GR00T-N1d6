@@ -128,3 +128,6 @@ tmp/
 output/
 ckpt/
 data/
+
+external_dependencies/
+gr00t/eval/sim/robocasa/venv/

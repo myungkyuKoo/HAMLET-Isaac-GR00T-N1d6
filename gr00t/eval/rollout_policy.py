@@ -96,30 +96,6 @@ class WrapperConfigs:
     multistep: MultiStepConfig = field(default_factory=MultiStepConfig)
 
 
-def get_simpler_env_fn(
-    env_name: str,
-):
-    def env_fn():
-        from gr00t.eval.sim.SimplerEnv.simpler_env import register_simpler_envs
-
-        register_simpler_envs()
-        return gym.make(env_name)
-
-    return env_fn
-
-
-def get_libero_env_fn(
-    env_name: str,
-):
-    def env_fn():
-        from gr00t.eval.sim.LIBERO.libero_env import register_libero_envs
-
-        register_libero_envs()
-        return gym.make(env_name)
-
-    return env_fn
-
-
 def get_robocasa_env_fn(env_name: str, env_idx: int = 0, seed: int | None = None):
     """RoboCasa-Kitchen factory (`robocasa_panda_omron/<task>_PandaOmron_Env` envs).
     """
@@ -135,19 +111,9 @@ def get_robocasa_env_fn(env_name: str, env_idx: int = 0, seed: int | None = None
 
 
 def get_gym_env(env_name: str, env_idx: int, total_n_envs: int):
-    """Create Ray environment factory function without wrappers."""
-
-    env_embodiment = get_embodiment_tag_from_env_name(env_name)
-
-    if env_embodiment in (EmbodimentTag.SIMPLER_ENV_GOOGLE, EmbodimentTag.SIMPLER_ENV_WIDOWX):
-        env_fn = get_simpler_env_fn(env_name)
-
-    elif env_embodiment in (EmbodimentTag.LIBERO_PANDA,):
-        env_fn = get_libero_env_fn(env_name)
-
-    elif env_name.startswith("robocasa_panda_omron/"):
+    """Create the benchmark environment (without wrappers)."""
+    if env_name.startswith("robocasa_panda_omron/"):
         env_fn = get_robocasa_env_fn(env_name, env_idx=env_idx)
-
     else:
         raise ValueError(f"Invalid environment name: {env_name}")
 
@@ -523,19 +489,16 @@ def create_gr00t_sim_policy(
     policy_client_host: str = "",
     policy_client_port: int | None = None,
 ) -> BasePolicy:
-    from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
-
     if policy_client_host and policy_client_port:
         from gr00t.policy.server_client import PolicyClient
 
         policy = PolicyClient(host=policy_client_host, port=policy_client_port)
     else:
-        gr00t_policy = Gr00tPolicy(
-            embodiment_tag=embodiment_tag,
-            model_path=model_path,
-            device=0,
+        raise NotImplementedError(
+            "Local (in-process) policy evaluation is not supported: serve the "
+            "checkpoint with scripts/run_gr00t_server_n1d5.py and pass "
+            "--policy-client-host/--policy-client-port (see run_scripts/eval_n1d5.sh)."
         )
-        policy = Gr00tSimPolicyWrapper(gr00t_policy)
     return policy
 
 

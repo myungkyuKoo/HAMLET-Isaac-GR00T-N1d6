@@ -248,19 +248,19 @@ class Gr00tPolicy(BasePolicy):
             ref = next((c for c in cached_mq if c is not None), None)
             if ref is not None:
                 ph = torch.zeros_like(ref)
-                self.model._cached_mq = torch.stack(
+                self.model._memory_cache = torch.stack(
                     [c if c is not None else ph for c in cached_mq], dim=0
                 ).to(_dev)
             else:
-                self.model._cached_mq = None
+                self.model._memory_cache = None
             ref_v = next((c for c in cached_vis if c is not None), None)
             if ref_v is not None:
                 ph_v = torch.zeros_like(ref_v)
-                self.model._cached_vis = torch.stack(
+                self.model._vision_cache = torch.stack(
                     [c if c is not None else ph_v for c in cached_vis], dim=0
                 ).to(_dev)
             else:
-                self.model._cached_vis = None
+                self.model._vision_cache = None
             relevant = cached_vis if is_vision else cached_mq
             opts["reset_memory"] = torch.tensor(
                 [bool(raw_reset[i] or relevant[i] is None) for i in range(B_s)],
@@ -283,18 +283,20 @@ class Gr00tPolicy(BasePolicy):
         normalized_input = self.apply_transforms(obs_copy)
         normalized_action = self._get_action_from_normalized_input(normalized_input, opts)
         if _session_active:
-            new_mq = self.model._cached_mq
+            # The model FIFO-updated its rolling cache in-place during the
+            # forward; persist each session's row back into per-session storage.
+            new_mq = self.model._memory_cache
             if new_mq is not None:
                 for i, sid in enumerate(session_ids):
                     self._session_mq_cache[sid] = new_mq[i].detach().clone()
-            new_vis = self.model._cached_vis
+            new_vis = self.model._vision_cache
             if new_vis is not None:
                 for i, sid in enumerate(session_ids):
                     self._session_vis_cache[sid] = new_vis[i].detach().clone()
             # Clear model slots so the next call rebuilds them from per-session
             # storage, then evict sessions beyond the LRU cap (oldest first).
-            self.model._cached_mq = None
-            self.model._cached_vis = None
+            self.model._memory_cache = None
+            self.model._vision_cache = None
             for sid in session_ids:
                 if sid in self._session_lru:
                     self._session_lru.remove(sid)

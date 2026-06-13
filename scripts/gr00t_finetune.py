@@ -289,13 +289,19 @@ def main(config: ArgsConfig):
     data_config_cls = load_data_config(config.data_config)
 
     # HAMLET: rebuild the video delta_indices to honor --memory-window.
-    if config.hamlet_mode == "finetune" and config.memory_window > 1:
+    if config.hamlet_mode == "finetune":
+        # Always rebuild (even for K=1): the data config default is K=4
+        # ([-48,-32,-16,0]), so leaving it unchanged for K=1 would feed 4
+        # backbone rows into a memory_window=1 model and raise in _apply_memory.
+        assert config.memory_window >= 1, (
+            f"--memory-window must be >= 1 (got {config.memory_window})"
+        )
         # Stride is bound to the action chunk (= len(action_indices)): the rolling
         # cache advances one chunk per policy call at inference, so the K snapshots
         # must be sampled one chunk apart at training to stay consistent.
         stride = len(data_config_cls.action_indices)
         K = config.memory_window
-        new_indices = [-(K - 1 - i) * stride for i in range(K)]
+        new_indices = [-(K - 1 - i) * stride for i in range(K)]  # K=1 -> [0]
         data_config_cls.video_observation_indices = new_indices
         print(
             f"[HAMLET] K-step batching: stride={stride} window={(K - 1) * stride} "
@@ -333,6 +339,19 @@ def main(config: ArgsConfig):
 
     modality_configs = data_config_cls.modality_config()
     transforms = data_config_cls.transform()
+
+    if config.hamlet_mode == "tcl":
+        from gr00t.model.transforms import HamletTclTransform
+
+        _last = transforms.transforms[-1] if hasattr(transforms, "transforms") else None
+        if not isinstance(_last, HamletTclTransform):
+            raise ValueError(
+                f"--hamlet-mode tcl requires a contrastive data config whose transform "
+                f"emits (anchor, positive, negative) triplets "
+                f"(e.g. --data-config single_panda_gripper_contrastive_sv); got "
+                f"transform {type(_last).__name__} from --data-config "
+                f"'{config.data_config}'."
+            )
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:

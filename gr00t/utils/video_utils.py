@@ -22,7 +22,6 @@ from typing import List, Optional, Tuple
 import av
 import cv2
 import numpy as np
-import torchvision
 
 
 # Neither decord nor torchcodec is imported at module level:
@@ -474,6 +473,8 @@ def get_frames_by_timestamps(
         return frames
 
     elif video_backend == "torchvision_av":
+        import torchvision
+
         # set backend
         torchvision.set_video_backend("pyav")
 

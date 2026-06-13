@@ -22,7 +22,10 @@ import msgpack
 import numpy as np
 import zmq
 
-from gr00t.data.dataset import ModalityConfig
+try:
+    from gr00t.data.dataset import ModalityConfig
+except ImportError:
+    ModalityConfig = None
 
 from .policy import BasePolicy
 
@@ -66,6 +69,8 @@ class MsgSerializer:
         if not isinstance(obj, dict):
             return obj
         if "__ModalityConfig_class__" in obj:
+            if ModalityConfig is None:
+                return obj["as_json"]
             return ModalityConfig(**obj["as_json"])
         if "__ndarray_class__" in obj:
             return np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
@@ -73,7 +78,7 @@ class MsgSerializer:
 
     @staticmethod
     def encode_custom_classes(obj):
-        if isinstance(obj, ModalityConfig):
+        if ModalityConfig is not None and isinstance(obj, ModalityConfig):
             return {
                 "__ModalityConfig_class__": True,
                 "as_json": to_json_serializable(obj),
