@@ -174,20 +174,10 @@ class EagleBackbone(nn.Module):
         attn_mask = eagle_input["attention_mask"]
         moment_mask = torch.ones(bsz, self.n_moment_tokens, dtype=attn_mask.dtype, device=device)
         full_attn = torch.cat([attn_mask, moment_mask], dim=1)
-        # Moment tokens sit after right-padding in sequence order, but their RoPE
-        # positions continue from each sample's REAL length (= attention_mask.sum)
-        # so train-time (padded batch) and inference-time (no padding) relative
-        # distances to the content tokens match exactly.
-        seq_len = token_emb.size(1)
-        prefix_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        real_len = attn_mask.sum(dim=1, keepdim=True).to(torch.long)  # (B, 1)
-        mq_pos = real_len + torch.arange(self.n_moment_tokens, device=device).unsqueeze(0)
-        full_pos = torch.cat([prefix_pos, mq_pos], dim=1)
 
         eagle_output = self.eagle_model.language_model(
             inputs_embeds=full_emb,
             attention_mask=full_attn,
-            position_ids=full_pos,
             output_hidden_states=True,
             return_dict=True,
         )
