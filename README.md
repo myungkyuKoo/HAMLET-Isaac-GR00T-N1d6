@@ -7,7 +7,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2510.00695-b31b1b.svg)](https://arxiv.org/abs/2510.00695v3)
 [![Project Page](https://img.shields.io/badge/Project-Page-1f72b1.svg)](https://myungkyukoo.github.io/hamlet/)
-[![N1.5 implementation](https://img.shields.io/badge/GR00T-N1.5%20version-success.svg)](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d5)
+[![N1.5 implementation](https://img.shields.io/badge/GR00T-N1.5%20version-success.svg)](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d6/tree/n1.5)
 
 </div>
 
@@ -16,7 +16,7 @@
 </p>
 
 > **This repository** is the official **HAMLET implementation on top of NVIDIA GR00T&nbsp;N1.6**, and evaluates on the **RoboMME** benchmark.<br>
-> The GR00T&nbsp;**N1.5** version, which evaluates on **RoboCasa-Kitchen** benchmark, lives in a separate repo: **[HAMLET-Isaac-GR00T-N1d5](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d5)**.<br>
+> The GR00T&nbsp;**N1.5** version, which evaluates on **RoboCasa-Kitchen** benchmark, lives on the **[`n1.5` branch](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d6/tree/n1.5)** of this repo.<br>
 > Paper: [arXiv:2510.00695](https://arxiv.org/abs/2510.00695v3) · Project page: [myungkyukoo.github.io/hamlet](https://myungkyukoo.github.io/hamlet/)
 
 ## 🧠 What is HAMLET?
