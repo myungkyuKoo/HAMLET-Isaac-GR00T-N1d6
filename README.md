@@ -1,6 +1,6 @@
 <div align="center">
 
-# HAMLET on GR00T&nbsp;N1.6
+# HAMLET on Isaac GR00T&nbsp;N1.6
 
 ### HAMLET: Switch your Vision-Language-Action Model into a History-Aware Policy
 ### ICLR 2026
@@ -15,13 +15,13 @@
   <img src="assets/overview.png" width="95%" alt="HAMLET overview"/>
 </p>
 
-> **This repository** is the official **HAMLET implementation on top of NVIDIA GR00T&nbsp;N1.6**, and evaluates on the **RoboMME** memory benchmark.<br>
-> The GR00T&nbsp;**N1.5** version, which evaluates on **RoboCasa-Kitchen**, lives in a separate repo: **[HAMLET-Isaac-GR00T-N1d5](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d5)**.<br>
+> **This repository** is the official **HAMLET implementation on top of NVIDIA GR00T&nbsp;N1.6**, and evaluates on the **RoboMME** benchmark.<br>
+> The GR00T&nbsp;**N1.5** version, which evaluates on **RoboCasa-Kitchen** benchmark, lives in a separate repo: **[HAMLET-Isaac-GR00T-N1d5](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d5)**.<br>
 > Paper: [arXiv:2510.00695](https://arxiv.org/abs/2510.00695v3) · Project page: [myungkyukoo.github.io/hamlet](https://myungkyukoo.github.io/hamlet/)
 
 ## 🧠 What is HAMLET?
 
-Most Vision-Language-Action (VLA) models are **Markovian**: they act from the *current* observation only and forget the past. **HAMLET** turns a pre-trained VLA into a **history-aware policy** with a small, efficient memory mechanism, without retraining the VLM backbone:
+Most Vision-Language-Action models (VLAs) are **Markovian**: they act from the *current* observation only and forget the past. **HAMLET** turns a pre-trained VLA into a **history-aware policy** with a small, efficient memory mechanism, without retraining the VLM backbone:
 
 - **Moment tokens**: a few learnable query tokens are appended to the VLM input each step; their post-LLM hidden states summarize "what happened now."
 - **Memory module**: a lightweight block-causal transformer aggregates the moment tokens over a window of past steps (oldest to current).
@@ -37,13 +37,13 @@ The HAMLET layer is exposed through a few CLI flags on top of the standard GR00T
 |---|---|---|
 | `--hamlet-mode` | `off` \| `tcl` \| `finetune` (finetune) | enable HAMLET (Stage-2 fine-tune) or TCL pretraining; `off` is vanilla GR00T |
 | `--n-moment-tokens` | int (4) | moment tokens per step (`n_q`) |
-| `--memory-window` | int (4) | history length `K` (timestep blocks); raise it to condition on longer past context. The window spans ≈ `(K-1) × action_chunk` control steps (e.g., `K=4` with a 16-step chunk ≈ 48 steps ≈ 4.8 s at 10 Hz) |
+| `--memory-window` | int (4) | history length `K` (timestep blocks); raise it to condition on longer past context. The window spans ≈ `(K-1) × action_chunk` control steps (*e.g.,* `K=4` with a 16-step chunk ≈ 48 steps ≈ 4.8 s at 10 Hz) |
 | `--memory-stride` | int (16) | environment steps between the `K` cached snapshots |
 | `--memory-num-layers` | int (2) | depth of the memory transformer module |
 | `--mem-cond-type` | `cross_attn` \| `adaln` (cross_attn) | how memory conditions the action head: concat into the cross-attention KV, **or** mean-pool into the DiT timestep embedding (AdaLN-zero) |
 | `--memory-type` | `moment_token` \| `vision_feature` (moment_token) | what flows through the memory module: learnable **moment tokens** (paper), or the **primary-view image tokens** (post-LLM, pooled to 64/step) *(optional; not in the paper, but may help with low-level spatial memory)* |
-| `--load-moment-tokens-from` | path (none) | warm-start `backbone.moment_tokens` from a Stage-1 (TCL) checkpoint dir or safetensors file |
-| `--freeze-moment-tokens` / `--no-freeze-moment-tokens` | (script default: no-freeze) | freeze the moment-token parameter during the HAMLET fine-tune (paper recipe when TCL-initialized) |
+| `--load-moment-tokens-from` | path (None) | warm-start `backbone.moment_tokens` from a Stage-1 (TCL) checkpoint dir or safetensors file |
+| `--freeze-moment-tokens` / `--no-freeze-moment-tokens` | (script default: no-freeze) | whether to freeze the moment tokens during the Stage-2 fine-tune. **Freezing saves training cost** (the tokens stay at their TCL-pretrained values and leave the optimizer); **unfreezing (default) gives the best performance**, since the tokens keep adapting during fine-tuning. |
 
 **Memory stride.** `--memory-stride` is the gap, in environment steps, between the `K` cached snapshots. Set it equal to the evaluation action-execution interval (`--n-action-steps`, default 16): the rolling memory cache advances once per policy call, so a matching stride keeps the training-time and inference-time history aligned.
 
@@ -52,18 +52,26 @@ The HAMLET layer is exposed through a few CLI flags on top of the standard GR00T
 **Moment-token initialization (TCL, optional).** Following the paper, the moment tokens can be warm-started with time-contrastive learning before the HAMLET fine-tune, then loaded (and optionally frozen) in Stage 2:
 
 ```bash
-# Stage 1 — TCL pretraining of the moment tokens (VLM frozen)
+# Stage 1: TCL pretraining of the moment tokens (VLM frozen)
 torchrun ... gr00t/experiment/launch_finetune.py ... \
     --hamlet-mode tcl --n-moment-tokens 4
 
-# Stage 2 — HAMLET fine-tune, warm-starting from the Stage-1 tokens
+# Stage 2: HAMLET fine-tune, warm-starting from the Stage-1 tokens
 torchrun ... gr00t/experiment/launch_finetune.py ... \
     --hamlet-mode finetune \
     --load-moment-tokens-from <stage1-output>/checkpoint-<N> \
-    --freeze-moment-tokens
+    --freeze-moment-tokens   # cost-saving option; omit for full performance
+
+# Single-stage Training: You may skip TCL-initialization and randomly initialize moment tokens, so the moment tokens are trained end-to-end.
+torchrun ... gr00t/experiment/launch_finetune.py ... \
+    --hamlet-mode finetune \
+    --n-moment-tokens 4 \
+    --no-freeze-moment-tokens
 ```
 
-`--load-moment-tokens-from` accepts a checkpoint directory or a `model*.safetensors` file and copies **only** `backbone.moment_tokens` (everything else still initializes from `--base-model-path`). Without it, moment tokens are randomly initialized and trained end-to-end — the default in `run_scripts/train_hamlet_n1d6.sh` (override via the `LOAD_MOMENT_TOKENS_FROM` / `FREEZE_MOMENT_TOKENS=1` environment variables).
+**Freeze vs. unfreeze (Stage 2).** Freezing the moment tokens (`--freeze-moment-tokens`) lowers training cost so it is a reasonable choice when compute is tight. For **best performance, keep them unfrozen** (`--no-freeze-moment-tokens`, the default): letting the moment tokens keep adapting during the fine-tune consistently yields higher success. Treat freezing as a cost-saving option, not the setting for peak quality.
+
+`--load-moment-tokens-from` accepts a checkpoint directory or a `model*.safetensors` file and copies **only** `backbone.moment_tokens` (everything else still initializes from `--base-model-path`). Without it, moment tokens are randomly initialized and trained end-to-end — the single-stage default in `run_scripts/train_hamlet_n1d6.sh` (opt into the two-stage recipe via the `LOAD_MOMENT_TOKENS_FROM` / `FREEZE_MOMENT_TOKENS=1` environment variables).
 
 
 ## ⚙️ Setup

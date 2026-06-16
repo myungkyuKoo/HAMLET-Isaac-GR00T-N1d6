@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET fine-tune on RoboMME -- turn the VLA into a history-aware policy.
 # Usage: DATASET_PATH=/path/to/robomme bash run_scripts/train_hamlet_n1d6.sh
+#
+# Single-stage by default: moment tokens are randomly initialized and trained end-to-end (no TCL-initialization).
+# To use the optional two-stage paper recipe instead, first run a Stage-1 TCL job (--hamlet-mode tcl),
+# then point LOAD_MOMENT_TOKENS_FROM at its checkpoint and set FREEZE_MOMENT_TOKENS=1.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
