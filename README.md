@@ -7,7 +7,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2510.00695-b31b1b.svg)](https://arxiv.org/abs/2510.00695v3)
 [![Project Page](https://img.shields.io/badge/Project-Page-1f72b1.svg)](https://myungkyukoo.github.io/hamlet/)
-[![N1.6 implementation](https://img.shields.io/badge/GR00T-N1.6%20version-success.svg)](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d6/tree/main)
+[![N1.6 implementation](https://img.shields.io/badge/GR00T-N1.6%20version-success.svg)](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T/tree/main)
 
 </div>
 
@@ -16,7 +16,7 @@
 </p>
 
 > **This repository** is the official **HAMLET implementation on top of NVIDIA GR00T&nbsp;N1.5**.<br>
-> The GR00T&nbsp;**N1.6** version, which evaluates on the **RoboMME** benchmark, lives on the **[`main` branch](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d6/tree/main)** of this repo.<br>
+> The GR00T&nbsp;**N1.6** version, which evaluates on the **RoboMME** benchmark, lives on the **[`main` branch](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T/tree/main)** of this repo.<br>
 > Paper: [arXiv:2510.00695](https://arxiv.org/abs/2510.00695v3) · Project page: [myungkyukoo.github.io/hamlet](https://myungkyukoo.github.io/hamlet/)
 
 ## 🧠 What is HAMLET?
