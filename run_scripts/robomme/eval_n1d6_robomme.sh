@@ -7,9 +7,9 @@
 # Usage:
 #   MODEL_PATH=/path/to/checkpoint-60000 \
 #   ROBOMME_PYTHON=/path/to/robomme_benchmark/venv/bin/python \
-#   bash run_scripts/eval_n1d6.sh
+#   bash run_scripts/robomme/eval_n1d6_robomme.sh
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # config (override via env)

@@ -1,0 +1,11 @@
+# Fixed keys (managed by eval_policy.py)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+# Bridge params (override via eval.sh / env)
+server_host: 127.0.0.1
+server_port: 5555
+exec_chunk: 16

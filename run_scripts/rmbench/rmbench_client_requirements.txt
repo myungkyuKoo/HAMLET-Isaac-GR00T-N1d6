@@ -1,0 +1,6 @@
+# Client-side deps for the RMBench policy plugin (gr00t/eval/sim/rmbench/policy/), installed into the
+# RMBench benchmark's conda env (RMBENCH_PYTHON): the ZMQ policy client needs msgpack + pyzmq. numpy is
+# already present in the RMBench env; listed for completeness.
+msgpack==1.2.1
+pyzmq==27.1.0
+numpy
