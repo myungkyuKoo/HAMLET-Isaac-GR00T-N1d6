@@ -191,13 +191,7 @@ Provided ready-to-use (LeRobot v2.1 with `videos/`, `meta/modality.json`, and `m
 huggingface-cli download --repo-type dataset Myungkyu/rmbench_lerobot --local-dir data/rmbench
 ```
 
-> **Provenance.** `Myungkyu/rmbench_lerobot` is **derived** from the official RMBench release
-> [`TianxingChen/RMBench`](https://huggingface.co/datasets/TianxingChen/RMBench) (`demo_clean` split, RoboTwin-2.0
-> per-episode HDF5, 50 expert demos/task). We converted it to GR00T-compatible LeRobot — selecting **only the
-> paper's 9 official tasks** (the `envs/` repo also ships `place_block_mat`, which is **not** one of the paper's 9,
-> so it is excluded) — reordering the 14-D action to contiguous `[L_arm6, R_arm6, L_grip, R_grip]`, mapping the
-> head/left/right cameras to the 3 views, and re-encoding video as h264. It is a **format/representation
-> conversion only**; the underlying trajectories are unchanged from the official release.
+> **Provenance.** `Myungkyu/rmbench_lerobot` is **derived** from the official RMBench release [`TianxingChen/RMBench`](https://huggingface.co/datasets/TianxingChen/RMBench) (`demo_clean` split, RoboTwin-2.0 per-episode HDF5, 50 expert demos/task). We converted it to GR00T-compatible LeRobot by reordering the 14-D action to contiguous `[L_arm6, R_arm6, L_grip, R_grip]`, mapping the head/left/right cameras to the 3 views, and re-encoding video as h264.
 
 ### Training
 
@@ -214,13 +208,11 @@ DATASET_PATH=data/rmbench bash run_scripts/rmbench/train_hamlet_n1d6.sh
 K=8 GRAD_ACCUM=2 DATASET_PATH=data/rmbench bash run_scripts/rmbench/train_hamlet_n1d6.sh
 ```
 
-> **Observe ("hold-still") frames are kept and supervised.** Some RMBench tasks (clearest: `observe_and_pickup`) require the policy to **stay still and observe** before information is hidden — at eval, moving during the observation window is an automatic failure. These static frames are the *robot's own required behavior*, so they are **kept and supervised** (the model learns to hold, and the memory captures the soon-to-be-hidden info). RMBench has **no `is_demo`/demonstration phase**, so there is **no demo-frame exclusion and no memory priming** at eval.
-
 ### Evaluation
 
 A policy-server + RMBench-simulator split. The trained policy is served by this repo (`gr00t/eval/run_gr00t_server.py`); RMBench's own harness drives the simulator and queries the server through our in-repo policy plugin (`gr00t/eval/sim/rmbench/policy/`). Only the **RMBench simulator** is external.
 
-- **Install the RMBench benchmark** (separate conda env): clone [`TianxingChen/RMBench`](https://github.com/TianxingChen/RMBench) and run its `script/_install.sh` (SAPIEN + CuRobo + pytorch3d). Two fixes for current dependencies: in `envs/curobo/.../geom/sdf/world_mesh.py` use `wp.device_from_torch(...)` (the `wp.torch.device_from_torch` path was removed in warp ≥ 1.x), and pin `setuptools<81` (SAPIEN imports `pkg_resources`). Then install the client deps into that env:
+- **Install the RMBench benchmark** (separate conda env): clone [`RoboTwin-Platform/RMBench`](https://github.com/robotwin-Platform/rmbench) and run its `script/_install.sh` (SAPIEN + CuRobo + pytorch3d). Two fixes for current dependencies: in `envs/curobo/.../geom/sdf/world_mesh.py` use `wp.device_from_torch(...)` (the `wp.torch.device_from_torch` path was removed in warp ≥ 1.x), and pin `setuptools<81` (SAPIEN imports `pkg_resources`). Then install the client deps into that env:
 
 ```bash
 pip install -r run_scripts/rmbench/rmbench_client_requirements.txt   # msgpack + pyzmq for the ZMQ policy client
@@ -273,7 +265,6 @@ run_scripts/                    runnable bash launchers (per benchmark)
 ## 📝 Notes
 
 - All paths/knobs are environment variables; nothing is machine-specific.
-- Checkpoints, rollouts (`*.mp4`), logs, and datasets are git-ignored.
 - The eval glue (RoboMME rollout client / RMBench policy plugin) is included; only the simulator package is external. See each benchmark's Evaluation.
 
 ## 🙏 Acknowledgements
